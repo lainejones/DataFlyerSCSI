@@ -1,0 +1,188 @@
+; -------------------------------------------------------------------------
+; DataFlyerSCSI - Installer script
+; Installs dataflyer.device (DEVS:), RDBMount (C:) and the tools, mounts the
+; SCSI drives' partitions at boot from S:User-Startup, and turns the original
+; DataFlyer software's lines into comments. Run it again to update or to
+; remove DataFlyerSCSI.
+; -------------------------------------------------------------------------
+(set @app-name "DataFlyerSCSI")
+(complete 0)
+
+(if (not (exists "Devs/dataflyer.device"))
+    (abort "Can't find the DataFlyerSCSI files next to this script.\n\n"
+           "Run the installer from the drawer it came in."))
+(if (< (/ (getversion "exec.library" (resident)) 65536) 40)
+    (abort "DataFlyerSCSI needs AmigaOS 3.1 or newer."))
+
+(set mode
+    (askchoice (prompt "DataFlyerSCSI @VER@ - a driver for the DataFlyer 1200 SCSI+\n\n"
+                       "dataflyer.device drives the board's SCSI port and the A1200's "
+                       "built-in IDE port; RDBMount mounts the SCSI drives' partitions "
+                       "at boot. The original SCSIPlus, DFMount and ExpXDS.device are "
+                       "not needed any more.\n\n"
+                       "What do you want to do?")
+               (help "Install also updates an existing DataFlyerSCSI; your boot lines are kept.\n"
+                     "Remove takes DataFlyerSCSI off this Amiga and can turn the original "
+                     "software's lines back on.")
+               (choices "Install or update DataFlyerSCSI" "Remove DataFlyerSCSI")
+               (default 0)))
+
+; the ARexx script edits the startup files (Installer can't edit a line).
+; ARexx needs RexxMast; RX and WaitForPort live in SYS:Rexxc, which only a
+; Shell's path has, so they are called by their full names. rexx_rc = the
+; script's answer, or -1 without ARexx.
+(procedure P_STARTUP
+    (if (or (not (exists "SYS:System/RexxMast" (noreq))) (not (exists "SYS:Rexxc/RX" (noreq))))
+        (set rexx_rc -1)
+      (
+        (run "SYS:System/RexxMast >NIL:")
+        (if (exists "SYS:Rexxc/WaitForPort" (noreq))
+            (run "SYS:Rexxc/WaitForPort >NIL: REXX"))
+        (set rexx_rc (run (cat "SYS:Rexxc/RX Tools/UserStartup.rexx " rexx_args) (safe)))
+      )))
+
+(set toolsdir (getenv "DataFlyerSCSI/toolsdir"))
+
+; =========================================================================
+; REMOVE
+; =========================================================================
+(if (= mode 1)
+  (
+    (if (= 0 (askbool (prompt "Remove DataFlyerSCSI from this Amiga?\n\n"
+                              "The SCSI drives' partitions will not be mounted at the "
+                              "next boot unless the original software is turned back on.")
+                      (help "The driver, RDBMount and the tools drawer are deleted and "
+                            "the RDBMount line is taken out of S:User-Startup.")
+                      (choices "Remove" "Cancel") (default 0)))
+        ((message "Nothing was changed.") (exit (quiet))))
+    (set restore
+        (askbool (prompt "Turn the original DataFlyer software's lines (SCSIPlus, DFMount) "
+                         "back on in the startup files, if the installer had turned them off?")
+                 (help "Say yes if you want to go back to ExpXDS.device. The lines were "
+                       "only turned into comments; they still have their old settings.")
+                 (choices "Turn them back on" "Leave them off") (default 0)))
+    (complete 10)
+    (set rexx_args "REMOVE")
+    (P_STARTUP)
+    (if restore ((set rexx_args "RESTORE") (P_STARTUP)))
+    (if (= rexx_rc -1)
+        (message "ARexx is not available, so the startup files were not changed.\n\n"
+                 "Take the lines between \";BEGIN DataFlyerSCSI\" and \";END DataFlyerSCSI\" "
+                 "out of S:User-Startup yourself."))
+    (complete 40)
+    (if (exists "DEVS:dataflyer.device" (noreq)) (delete "DEVS:dataflyer.device"))
+    (if (exists "C:RDBMount" (noreq))
+        (if (= 0 (run "Search >NIL: C:RDBMount \"DataFlyerSCSI\"" (safe)))
+            (delete "C:RDBMount")))
+    (if (<> toolsdir "")
+        (if (exists toolsdir (noreq))
+            (run (cat "Delete >NIL: \"" toolsdir "\" ALL QUIET"))))
+    (if (exists (cat toolsdir ".info") (noreq)) (delete (cat toolsdir ".info")))
+    ; FILES only in ENV:, then ENVARC:. Deleting the ENV:DataFlyerSCSI drawer
+    ; itself while ENVARC:DataFlyerSCSI exists crashes OS 3.2's lazy ENV:
+    ; (alert 8100 0005; seen in WinUAE on the first Remove test). The empty
+    ; ENV: drawer stays until the reboot, which is harmless.
+    (run "Delete >NIL: ENV:DataFlyerSCSI/#? QUIET FORCE")
+    (run "Delete >NIL: ENVARC:DataFlyerSCSI ALL QUIET FORCE")
+    (complete 100)
+    (message "DataFlyerSCSI has been removed.\n\n"
+             "Reboot: the driver stays in memory until then.")
+    (exit (quiet))
+  ))
+
+; =========================================================================
+; INSTALL
+; =========================================================================
+; the questions first; nothing changes until the copying starts
+(if (= toolsdir "")
+    (set toolsdir
+        (tackon (askdir (prompt "Where should the DataFlyerSCSI tools drawer go?\n\n"
+                                "A drawer \"DataFlyerSCSI\" is made there, with the test "
+                                "tools, this manual and a CD-ROM mount file.")
+                        (help "Any drawer you open from Workbench, for example SYS:Tools.")
+                        (default (if (exists "SYS:Tools" (noreq)) "SYS:Tools" "SYS:")))
+                "DataFlyerSCSI")))
+
+(set bootlines
+    (askbool (prompt "Mount the SCSI drives' partitions at every boot?\n\n"
+                     "Two lines go to the end of S:User-Startup, and the original "
+                     "software's lines (SCSIPlus, DFMount, XDSFix) in S:Startup-Sequence "
+                     "and S:User-Startup are turned into comments. They must not run "
+                     "together with this driver.")
+             (help "Say no if you want to edit the startup files yourself. The line to "
+                   "add is:\n\n   C:RDBMount >NIL: ALL\n\nor, faster at boot, with the "
+                   "units named:\n\n   C:RDBMount >NIL: UNITS=3,4")
+             (choices "Yes" "No, I'll do it myself") (default 0)))
+
+; ---- the files --------------------------------------------------------------
+(complete 20)
+; copyfiles, not copylib: copylib skipped both files on the first real test
+; (same version in DEVS:, no version in C:) and said nothing
+(copyfiles (prompt "Copying dataflyer.device to DEVS:")
+           (help @copyfiles-help)
+           (source "Devs/dataflyer.device") (dest "DEVS:") (nogauge))
+(copyfiles (prompt "Copying RDBMount to C:")
+           (help @copyfiles-help)
+           (source "C/RDBMount") (dest "C:") (nogauge))
+(complete 40)
+(if (not (exists toolsdir (noreq))) (makedir toolsdir (infos)))
+(copyfiles (prompt "Copying the tools")
+           (help @copyfiles-help)
+           (source "Tools") (dest toolsdir) (all) (nogauge) (infos))
+(copyfiles (source "DataFlyerSCSI.guide") (dest toolsdir) (nogauge) (infos))
+(copyfiles (source "README") (dest toolsdir) (nogauge) (infos))
+(copyfiles (source "Storage/DOSDrivers/CD0") (dest toolsdir) (nogauge))
+(if (not (exists "ENVARC:DataFlyerSCSI" (noreq))) (makedir "ENVARC:DataFlyerSCSI"))
+(textfile (dest "ENVARC:DataFlyerSCSI/toolsdir") (append toolsdir))
+(complete 60)
+
+; ---- the drives --------------------------------------------------------------
+; RDBMount ALL mounts what it finds now (so the partitions appear at once) and
+; leaves the units that had an RDB in ENV:DataFlyerSCSI/units
+(working "Looking for drives on the SCSI port...")
+(run "C:RDBMount >NIL: ALL")
+(set units (getenv "DataFlyerSCSI/units"))
+(if (= units "")
+    (message "No drive with partitions was found on the SCSI port or the built-in "
+             "IDE port.\n\nThe driver is installed anyway; partition a drive with "
+             "HDToolBox (HDToolBox dataflyer.device) and run this installer again, or "
+             "add the RDBMount line to S:User-Startup yourself.")
+    (message (cat "Drives with partitions were found on unit(s) " units
+                  ". Their partitions are mounted now.")))
+(complete 70)
+
+; ---- the boot lines ------------------------------------------------------------
+(if bootlines
+  (
+    (set rdbarg
+        (if (= units "") "ALL"
+            (if (askbool (prompt (cat "At boot, mount the partitions of unit(s) " units
+                                      " only, or look at every unit?\n\n"
+                                      "Naming the units is faster: every empty SCSI id "
+                                      "costs a quarter of a second at boot."))
+                         (help "Choose \"every unit\" if you plan to add drives and don't "
+                               "want to run the installer again.")
+                         (choices (cat "Units " units) "Every unit") (default 0))
+                (cat "UNITS=" units) "ALL")))
+    (set rexx_args (cat "ADD " rdbarg))
+    (P_STARTUP)
+    (if (= rexx_rc -1)
+        (message "ARexx is not available, so the startup files were not changed.\n\n"
+                 "Add this line to the end of S:User-Startup yourself, and put a \";\" "
+                 "in front of the SCSIPlus and DFMount lines:\n\n"
+                 "   C:RDBMount >NIL: " rdbarg)
+        (if (<> rexx_rc 0)
+            (message "The startup files could not be written (Tools/UserStartup.rexx "
+                     "returned " rexx_rc ").\n\nAdd this line to the end of "
+                     "S:User-Startup yourself:\n\n   C:RDBMount >NIL: " rdbarg)))
+  ))
+(complete 85)
+
+(complete 100)
+
+(message "DataFlyerSCSI @VER@ is installed.\n\n"
+         "dataflyer.device is in DEVS:, RDBMount in C:, the tools and the manual in "
+         toolsdir ".\n\nReboot now: the SCSI partitions are mounted at boot from "
+         "S:User-Startup, and HDToolBox works on the drives with\n\n"
+         "   HDToolBox dataflyer.device")
+(exit (quiet))

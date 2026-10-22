@@ -1,0 +1,30 @@
+/* $VER: CD0 (DataFlyerSCSI) 1.0
+ *
+ * A CD-ROM on the DataFlyer 1200 SCSI+, with the system's own ISO 9660
+ * file system (L:CDFileSystem, AmigaOS 3.1 and newer).
+ *
+ * Unit = the drive's SCSI id (2 here). A CD-ROM on the A1200's built-in IDE
+ * port is unit 100 (master) or 101 (slave).
+ *
+ * Copy this file to SYS:Storage/DOSDrivers and double-click it to mount the
+ * drive, or to DEVS:DOSDrivers to have CD0: at every boot.
+ */
+Device          = dataflyer.device
+Unit            = 2
+FileSystem      = L:CDFileSystem
+DosType         = 0x43443031
+SectorSize      = 2048
+Surfaces        = 1
+SectorsPerTrack = 1
+Flags           = 0
+Mask            = 0x7ffffffe
+MaxTransfer     = 0x100000
+Reserved        = 0
+Interleave      = 0
+LowCyl          = 0
+HighCyl         = 0
+Buffers         = 5
+BufMemType      = 0
+StackSize       = 2000
+Priority        = 10
+GlobVec         = -1

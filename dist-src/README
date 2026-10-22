@@ -1,0 +1,26 @@
+DataFlyerSCSI @VER@
+===================
+
+A driver for the Expansion Systems DataFlyer 1200 SCSI+ on AmigaOS 3.1 and
+newer: dataflyer.device, with RDBMount to mount the SCSI drives at boot and
+tools to test and look at drives. The original SCSIPlus, DFMount and
+ExpXDS.device are not needed any more.
+
+Install: double-click Install_DataFlyerSCSI. It copies the driver to DEVS:
+and RDBMount to C:, puts the tools where you say, mounts the drives it finds,
+adds the boot line to S:User-Startup and turns the original software's lines
+into comments. Run it again to update or to remove.
+
+The manual is DataFlyerSCSI.guide (double-click it); it explains the card, the
+driver, every tool, HDToolBox, and what to do when something does not work.
+
+What is where:
+  Devs/dataflyer.device        the driver
+  C/RDBMount                   mounts the partitions of SCSI drives (boot)
+  Tools/                       flytest, flystat, flyprobe, flyirq, flychange, devlist,
+                               fcmp, flyread, tick, UserStartup.rexx
+  Storage/DOSDrivers/CD0       a mount file for a SCSI CD-ROM (CDFileSystem)
+  DataFlyerSCSI.guide          the manual
+  LICENSE                      GNU GPL version 3
+
+Source and bug reports: https://github.com/lainejones/DataFlyerSCSI
