@@ -36,9 +36,9 @@ DF_GUIDEVER="$VER ($(date +%d.%m.%Y))" python tools/mkguide.py docs/manual $D/Da
 # icons: the committed .info files, copied as they are
 I=icons
 cp $I/Install_DataFlyerSCSI.info $I/README.info $I/DataFlyerSCSI.guide.info $D/
+# one plain drawer icon for the package drawer (tools/makeicon_drawer32.py),
+# no subdrawer icons: the installer gives the drawers the system's own
 cp $I/DataFlyerSCSI.info dist/DataFlyerSCSI.info
-for dr in C Tools Storage Devs; do cp $I/$dr.info $D/$dr.info; done
-cp $I/drawer.info $D/Storage/DOSDrivers.info
 
 echo "DataFlyerSCSI $VER:"
 find dist -type f | sort

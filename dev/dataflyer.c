@@ -361,8 +361,12 @@ static int run_cmd(int id, int lun, const UBYTE *cdb, int cdblen,
         CHIP(R_TCR) = (UBYTE)phase;
         switch (phase) {
         case PH_COMMAND:
-            /* SCSI-1 style LUN in byte 1 (the target is selected without IDENTIFY) */
-            b = ci == 0 ? c0 : ci == 1 ? (UBYTE)((c1 & 0x1f) | (lun << 5)) : ci < cdblen ? cdb[ci] : 0;
+            /* SCSI-1 style LUN in byte 1 (the target is selected without IDENTIFY) -
+             * standard commands only: in a vendor command (group 6/7, $C0-$FF)
+             * byte 1 is the vendor's own (the BlueSCSI/ZuluSCSI Toolbox's file
+             * index: files from the 33rd on read as index & 31) */
+            b = ci == 0 ? c0 : ci == 1 && c0 < 0xc0 ? (UBYTE)((c1 & 0x1f) | (lun << 5))
+              : ci < cdblen ? cdb[ci] : 0;
             if (!put_byte(b)) goto busfail;
             ci++;
             break;
@@ -1214,7 +1218,7 @@ struct Device *df_init(REG(d0, BPTR seg))
     dev->dd_Library.lib_Node.ln_Name = (char *)df_devname;
     dev->dd_Library.lib_Flags = LIBF_SUMUSED | LIBF_CHANGED;
     dev->dd_Library.lib_Version = 1;
-    dev->dd_Library.lib_Revision = 3;
+    dev->dd_Library.lib_Revision = 4;
     dev->dd_Library.lib_IdString = (APTR)df_idstring;
     dfdev = dev;
     AddDevice(dev);

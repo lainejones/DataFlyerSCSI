@@ -16,6 +16,9 @@ Double-click `Install_DataFlyerSCSI`. It asks what to do and then:
 Reboot afterwards. The old `ExpXDS.device`, `SCSIPlus` and `DFMount` stay
 where they were, unused.
 
+The tools drawer it makes, and the unpacked `DataFlyerSCSI` drawer, get your
+Workbench's own drawer icon.
+
 The installer starts in Intermediate mode, so it shows what it does and asks
 about anything it is not sure of. Run it again later to update the driver, to
 change the boot lines, or to remove it all.
