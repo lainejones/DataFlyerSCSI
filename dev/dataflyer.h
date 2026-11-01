@@ -17,13 +17,24 @@
 #define SEL_IDE()   ((void)*(volatile UWORD *)0xDA1016UL)
 #define CIA_PRA     (*(volatile UBYTE *)0xBFE001UL)   /* a read takes about 1.4 us */
 
+/* a command's result besides a status byte and -1 (no target / bus error):
+ * the data phase went against the caller's direction or past its buffer,
+ * and the command was aborted (HD_SCSICMD: HFERR_Phase) */
+#define DF_PHASE    (-2)
+/* the REQ/ACK handshake through the port failed: the target never answered
+ * an ACK (HD_SCSICMD: HFERR_DMA). -1 stays the selection failure
+ * (HFERR_SelTimeout); a lost bus or a time-out mid-command is DF_PHASE. */
+#define DF_BUS      (-3)
+
 /* unit numbers: SCSI id + 10 * LUN; the built-in IDE port's two drives: */
 #define IDE_UNIT0   100              /* master; 101 = slave */
 
 struct DFUnit {
     struct Unit u;
     UBYTE id, lun, removable, devtype;
-    ULONG blocks, bsize;             /* from READ CAPACITY (0 = not read yet) */
+    UBYTE flush;                     /* ATA: FLUSH CACHE from IDENTIFY word 83 (1 = $E7, 2 = EXT $EA), 0 = none */
+    UBYTE wp;                        /* write protected (TD_PROTSTATUS): the MODE SENSE header's WP bit, or a CD-ROM */
+    ULONG blocks, bsize;             /* from READ CAPACITY (0 = not read yet, or no medium) */
     ULONG changes;
     struct List chgints;             /* pending TD_ADDCHANGEINT requests (their io_Data = the Interrupt) */
     UBYTE medium;                    /* what the last poll saw: 0 unknown, 1 a medium in, 2 none */

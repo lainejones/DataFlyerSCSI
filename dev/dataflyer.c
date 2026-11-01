@@ -49,6 +49,7 @@ extern const char df_devname[], df_idstring[];
 #define R_RPI  7
 
 #define ICR_DBUS 0x01
+#define ICR_ATN  0x02
 #define ICR_SEL  0x04
 #define ICR_ACK  0x10
 #define ICR_RST  0x80
@@ -68,6 +69,8 @@ extern const char df_devname[], df_idstring[];
 /* timeouts, counted in CIA reads (~1.4 us each, the same on every CPU) */
 #define T_SELECT   180000            /* 250 ms selection timeout */
 #define T_REQ     7000000            /* 10 s for a target to ask for the next byte */
+#define T_REQ_2M  84000000           /* 2 minutes: commands that work before they answer (req_budget) */
+#define T_REQ_10M 420000000          /* 10 minutes: FORMAT UNIT, SANITIZE, ERASE */
 #define T_ACK      140000            /* 200 ms */
 
 /* the most transferred in one Forbid(): 64 KB, then the system gets a turn */
@@ -81,6 +84,7 @@ static struct DFUnit *units[MAX_UNITS];
 static struct Task *task;
 static struct MsgPort *cmdport;      /* the task's; NULL until it runs */
 struct SignalSemaphore buslock;
+static struct SignalSemaphore openlock;  /* df_open: one at a time */
 static UBYTE sense_buf[32];
 static UBYTE pio_only;                /* 1 = programmed I/O only, no pseudo-DMA (not switchable yet) */
 static ULONG opts = 1;                /* DF_OPTS: bit 0 = writes in 256-byte runs (on; flystat OPTS=0 turns it off) */
@@ -103,6 +107,8 @@ void *memset(void *d, int c, unsigned long n)
 }
 
 struct DFStats stats;            /* DF_STATS (tools/flystat) */
+
+static ULONG be32(const UBYTE *p) { return ((ULONG)p[0] << 24) | ((ULONG)p[1] << 16) | ((ULONG)p[2] << 8) | p[3]; }
 
 #ifdef DFDEBUG
 /* a debug build (make DEBUG=1) logs every request and SCSI command to the serial port */
@@ -180,8 +186,12 @@ static int wait_clear(int reg, UBYTE mask, ULONG t, int site)
     return 0;
 }
 
+/* ICR_ATN while a command is being aborted: kept up through every handshake */
+static UBYTE atn;
+
 static void chip_idle(void)
 {
+    atn = 0;
     CHIP(R_MR) = 0;
     CHIP(R_ICR) = 0;
     CHIP(R_TCR) = 0;
@@ -209,22 +219,38 @@ static int select_target(int id)
 static int put_byte(UBYTE b)
 {
     CHIP(R_CSD) = b;
-    CHIP(R_ICR) = ICR_DBUS;
-    CHIP(R_ICR) = ICR_DBUS | ICR_ACK;
+    CHIP(R_ICR) = atn | ICR_DBUS;
+    CHIP(R_ICR) = atn | ICR_DBUS | ICR_ACK;
     if (!wait_clear(R_CSBS, CSBS_REQ, T_ACK, W_ACK))
         return 0;
-    CHIP(R_ICR) = 0;
+    CHIP(R_ICR) = atn;
     return 1;
 }
 
 static int get_byte(UBYTE *b)
 {
     *b = CHIP(R_CSD);
-    CHIP(R_ICR) = ICR_ACK;
+    CHIP(R_ICR) = atn | ICR_ACK;
     if (!wait_clear(R_CSBS, CSBS_REQ, T_ACK, W_ACK))
         return 0;
-    CHIP(R_ICR) = 0;
+    CHIP(R_ICR) = atn;
     return 1;
+}
+
+/* RST for 25 us or more, then the reset-to-selection time (250 ms). The
+ * only way to get a target out of a DATA OUT phase without handing it a
+ * byte: it waits for every byte it asked for. Every target reports a UNIT
+ * ATTENTION afterwards (rw sends a chunk once more for that). */
+static void bus_reset(void)
+{
+    ULONG n = 0, used = 0;
+    int k;
+    CHIP(R_MR) = 0;
+    CHIP(R_TCR) = 0;
+    CHIP(R_ICR) = ICR_RST;
+    for (k = 0; k < 40; k++) (void)CIA_PRA;     /* ~56 us */
+    chip_idle();
+    while (used < T_SELECT) { used += wait_step(n); n++; }
 }
 
 /* ---- pseudo-DMA: the data phases through the port at $DA1002 -------------
@@ -240,6 +266,11 @@ static int get_byte(UBYTE *b)
 #define R_SDS  5    /* write: start DMA send             */
 #define R_SDIR 7    /* write: start DMA initiator receive */
 
+/* the REQ-wait budget of the command running (req_budget), and whether a
+ * data phase ran out of it: the command is over then (the bus gets a reset) */
+static ULONG t_req = T_REQ;
+static UBYTE dma_timeout;
+
 /* DMA REQUEST not up yet: a short spin first (the next byte is usually a
  * few register reads away), then the timed wait. 1 = DRQ, -1 = the phase
  * changed (the target moved on), 0 = timeout. */
@@ -252,7 +283,7 @@ static int drq_wait(int site)
         if (!(b & BSR_PHASE)) return -1;     /* first: DMA REQUEST can stay up after the phase changed */
         if (b & BSR_DRQ) return 1;
     }
-    for (t = 0; t < T_REQ; ) {
+    for (t = 0; t < t_req; ) {
         UBYTE b = CHIP(R_BSR);
         if (!(b & BSR_PHASE)) { stats.polls[site] += n; return -1; }
         if (b & BSR_DRQ) { stats.polls[site] += n; return 1; }
@@ -270,23 +301,63 @@ static int drq_wait(int site)
  * moved; it stops early when the chip is not ready (the caller waits). */
 #define IRQ_BLOCK 512
 /* runs of 256 bytes per DMA REQUEST test (df_dmain, and df_dmaout_run with
- * DF_OPTS bit 0) only for whole blocks of a READ or WRITE: once the target
- * sends the first byte of a block it sends all of it. Any other command
- * (INQUIRY, MODE SENSE, ...) may end its data early, and a blind read of a
- * byte that never comes holds the bus for good. */
+ * DF_OPTS bit 0) only when the target is certain to deliver every byte of
+ * the run (block_run): a blind read of a byte that never comes holds the
+ * CPU on the bus cycle with interrupts off - the whole machine freezes,
+ * nothing can time out. Everything else goes a byte at a time, DMA
+ * REQUEST tested before each (bounded: the loop ends at the first byte
+ * the chip is not ready for). */
 static UBYTE blockxfer;
+
+/* whole blocks of a plain READ/WRITE (6/10/12/16) to a disk-like unit
+ * (direct access, CD-ROM, optical, simplified direct access) whose block
+ * size is known and a multiple of 256, with the buffer exactly the CDB's
+ * blocks x the block size. A tape's READ(6) counts bytes (variable
+ * records), a scanner's READ(10) ends short, a 520- or 2352-byte block
+ * ends inside a run, a scsi_Length past the command's data waits for
+ * bytes that never come: all of those take the byte path. */
+static int block_run(const struct DFUnit *un, const UBYTE *cdb, int cdblen, ULONG len)
+{
+    ULONG nblk;
+    if (!un->bsize || (un->bsize & 255) || !len)
+        return 0;
+    if (un->devtype != 0 && un->devtype != 5 && un->devtype != 7 && un->devtype != 0x0e)
+        return 0;
+    switch (cdb[0]) {
+    case 0x08: case 0x0a:                                /* READ/WRITE(6): 0 = 256 blocks */
+        if (cdblen < 6) return 0;
+        nblk = cdb[4] ? cdb[4] : 256;
+        break;
+    case 0x28: case 0x2a:
+        if (cdblen < 10) return 0;
+        nblk = ((ULONG)cdb[7] << 8) | cdb[8];
+        break;
+    case 0xa8: case 0xaa:
+        if (cdblen < 12) return 0;
+        nblk = be32(cdb + 6);
+        break;
+    case 0x88: case 0x8a:
+        if (cdblen < 16) return 0;
+        nblk = be32(cdb + 10);
+        break;
+    default:
+        return 0;
+    }
+    return nblk <= 0xffffffffUL / un->bsize && nblk * un->bsize == len;
+}
 
 static ULONG burst(UBYTE *p, ULONG n, int out)
 {
     ULONG done = 0;
+    int runs = blockxfer && !(n & 255);              /* what is left ends on a run boundary */
     while (done < n) {
         ULONG want = n - done, got;
         if (want > IRQ_BLOCK) want = IRQ_BLOCK;
         Disable();
         if (out)
-            got = (blockxfer && (opts & 1)) ? df_dmaout_run(p + done, want) : df_dmaout(p + done, want);
+            got = (runs && (opts & 1)) ? df_dmaout_run(p + done, want) : df_dmaout(p + done, want);
         else
-            got = blockxfer ? df_dmain(p + done, want) : df_dmain_byte(p + done, want);
+            got = runs ? df_dmain(p + done, want) : df_dmain_byte(p + done, want);
         Enable();
         done += got;
         if (got < want) break;
@@ -305,7 +376,7 @@ static ULONG dma_in(UBYTE *p, ULONG n)
         if (i >= n) break;
         r = drq_wait(W_DMAIN);
         if (r < 0) goto done;                    /* the target moved on */
-        if (!r) break;
+        if (!r) { dma_timeout = 1; break; }
     }
 done:
     CHIP(R_MR) = 0;
@@ -325,7 +396,7 @@ static ULONG dma_out(const UBYTE *p, ULONG n)
         if (i >= n) break;
         r = drq_wait(W_DMAOUT);
         if (r < 0) goto done;
-        if (!r) break;
+        if (!r) { dma_timeout = 1; goto done; }  /* the chip is not ready: no extra byte into it */
     }
     /* ExpXDS writes one more byte here: it completes the last handshake on
      * the card; once the phase has changed the chip ignores it */
@@ -337,23 +408,57 @@ done:
     return i;
 }
 
+/* an abort drains at most this much DATA IN while it waits for MESSAGE OUT,
+ * and feeds a DATA OUT at most this many bytes */
+#define T_DRAIN 65536
+#define T_FEED  16
+
+/* How long a target may take to ask for the next byte: 10 s, except for
+ * the commands that do their work before they answer - a FORMAT UNIT or
+ * SANITIZE runs for minutes, a START (IMMED=0) on an old full-height drive
+ * half a minute, a VERIFY or SYNCHRONIZE CACHE as long as the disk takes.
+ * The 10 s limit failed those and left the target holding the bus. */
+static ULONG req_budget(UBYTE op)
+{
+    switch (op) {
+    case 0x04: case 0x48: case 0x19:                    /* FORMAT UNIT, SANITIZE, ERASE (tape) */
+        return T_REQ_10M;
+    case 0x41: case 0x93:                               /* WRITE SAME (10/16) */
+    case 0x1d: case 0x1b:                               /* SEND DIAGNOSTIC, START STOP UNIT / LOAD UNLOAD */
+    case 0x2f: case 0x8f:                               /* VERIFY (10/16) */
+    case 0x35: case 0x91:                               /* SYNCHRONIZE CACHE (10/16) */
+    case 0x01: case 0x11:                               /* REWIND, SPACE (tape) */
+        return T_REQ_2M;
+    }
+    return T_REQ;
+}
+
 /* one SCSI command; the caller holds the bus (Forbid + SCSI selected).
- * Returns the status byte, or -1 (no target / bus error). */
+ * Returns the status byte, -1 (no target answers the selection), DF_PHASE
+ * (the target's data phase went against the caller's direction or past its
+ * buffer and the command was aborted; or the target stopped asking within
+ * its budget / let the bus go without COMMAND COMPLETE - the bus was reset
+ * if it still held it) or DF_BUS (a REQ/ACK handshake failed). *actual =
+ * the bytes that really moved to or from the caller's buffer. */
 static int run_cmd(int id, int lun, const UBYTE *cdb, int cdblen,
                    UBYTE *data, ULONG len, int out, ULONG *actual)
 {
-    int status = -1, ci = 0;
-    ULONG di = 0;
+    int status = -1, ci = 0, abort = 0;
+    ULONG di = 0, junk = 0, fed = 0;
     UBYTE c0 = cdb[0], c1 = cdb[1];
 
     *actual = 0;
+    t_req = req_budget(c0);
+    dma_timeout = 0;
     if (!select_target(id))
         return -1;
     for (;;) {
         UBYTE csbs, b;
         int phase;
-        if (!wait_set(R_CSBS, CSBS_REQ, T_REQ, W_REQ))
+        if (!wait_set(R_CSBS, CSBS_REQ, t_req, W_REQ)) {
+            if (CHIP(R_CSBS) & CSBS_BSY) goto reset;    /* out of time with the target on the bus: free it */
             break;
+        }
         csbs = CHIP(R_CSBS);
         if (!(csbs & CSBS_BSY))
             break;
@@ -362,32 +467,69 @@ static int run_cmd(int id, int lun, const UBYTE *cdb, int cdblen,
         switch (phase) {
         case PH_COMMAND:
             /* SCSI-1 style LUN in byte 1 (the target is selected without IDENTIFY) -
-             * standard commands only: in a vendor command (group 6/7, $C0-$FF)
-             * byte 1 is the vendor's own (the BlueSCSI/ZuluSCSI Toolbox's file
-             * index: files from the 33rd on read as index & 31) */
-            b = ci == 0 ? c0 : ci == 1 && c0 < 0xc0 ? (UBYTE)((c1 & 0x1f) | (lun << 5))
+             * for LUN > 0 and standard commands only: in a vendor command (group
+             * 6/7, $C0-$FF) byte 1 is the vendor's own (the BlueSCSI/ZuluSCSI
+             * Toolbox's file index: files from the 33rd on read as index & 31),
+             * and on LUN 0 the caller's byte 1 goes as it is (bits 5-7 are
+             * RDPROTECT, the SEND DIAGNOSTIC self-test code, ... in newer commands) */
+            b = ci == 0 ? c0 : ci == 1 && lun && c0 < 0xc0 ? (UBYTE)((c1 & 0x1f) | (lun << 5))
               : ci < cdblen ? cdb[ci] : 0;
             if (!put_byte(b)) goto busfail;
             ci++;
             break;
         case PH_DATA_IN:
-            if (!out && di < len && !pio_only) {
+            /* the caller said write (and gave a buffer): the target's data is
+             * not for it. ATN up, the bytes go to a bit bucket until the target
+             * takes the ABORT message (or finishes); the request fails. */
+            if (!abort && out && len) {
+                abort = 1;
+                atn = ICR_ATN;
+                CHIP(R_ICR) = atn;
+            }
+            if (!abort && !out && di < len && !pio_only) {
                 di += dma_in(data + di, len - di);
+                if (dma_timeout) goto reset;
                 break;
             }
-            if (!get_byte(&b)) goto busfail;     /* more than asked for: dropped */
-            if (!out && di < len) data[di] = b;
+            if (!get_byte(&b)) goto busfail;
+            if (abort) {
+                if (++junk > T_DRAIN) goto reset;
+                break;
+            }
+            /* more than the buffer holds (an allocation length longer than
+             * scsi_Length, as HDToolBox sends): dropped, as every Amiga SCSI
+             * driver does - a read has no side effect, scsi_Actual = the buffer */
+            if (di < len) data[di] = b;
             di++;
             break;
         case PH_DATA_OUT:
-            if (out && di < len && !pio_only) {
-                di += dma_out(data + di, len - di);
+            /* only the caller's own bytes go out. The target wants data the
+             * caller did not give (SCSIF_READ, or past scsi_Length; 1.0.4 sent
+             * zeros, which a WRITE put on the disk). It can't leave the phase
+             * without a byte, and ATN only counts after one: so first the SCSI
+             * way - ATN up and one byte (0) under it, so the target can go to
+             * MESSAGE OUT and take the ABORT (PH_MSG_OUT below): the whole
+             * command is discarded, so that byte never reaches a disk. A
+             * target that keeps asking for data with ATN up gets at most
+             * T_FEED such bytes, then the bus is reset, as 1.0.5 did at once.
+             * WinUAE's emulation ignores ATN in a data phase, so the reset is
+             * the path it exercises; a real target should take the ABORT. */
+            if (abort || !out || di >= len) {
+                if (!abort) { abort = 1; atn = ICR_ATN; CHIP(R_ICR) = atn; }
+                if (++fed > T_FEED) goto reset;
+                if (!put_byte(0)) goto busfail;
                 break;
             }
-            if (!put_byte(out && di < len ? data[di] : 0)) goto busfail;
+            if (!pio_only) {
+                di += dma_out(data + di, len - di);
+                if (dma_timeout) goto reset;
+                break;
+            }
+            if (!put_byte(data[di])) goto busfail;
             di++;
             break;
         case PH_STATUS:
+            if (atn) { atn = 0; CHIP(R_ICR) = 0; }   /* the data is over: nothing left to abort */
             if (!get_byte(&b)) goto busfail;
             status = b;
             break;
@@ -397,41 +539,56 @@ static int run_cmd(int id, int lun, const UBYTE *cdb, int cdblen,
                 CHIP(R_TCR) = 0;
                 wait_clear(R_CSBS, CSBS_BSY, T_ACK, W_BSYEND);
                 *actual = di < len ? di : len;
-                return status;
+                return abort ? DF_PHASE : status;
             }
             break;
         case PH_MSG_OUT:
+            if (abort) {
+                atn = 0;                         /* ATN off before the message byte's ACK */
+                if (!put_byte(0x06)) goto busfail;   /* ABORT: the target goes bus free */
+                CHIP(R_TCR) = 0;
+                if (!wait_clear(R_CSBS, CSBS_BSY, T_ACK, W_BSYEND)) goto reset;
+                chip_idle();
+                *actual = di < len ? di : len;
+                return DF_PHASE;
+            }
             if (!put_byte(0x08)) goto busfail;   /* NOP */
             break;
         default:
             goto busfail;
         }
     }
+    /* the target let the bus go without COMMAND COMPLETE: the status if one
+     * came, else the command is lost (it was selected, so not "no target") */
     *actual = di < len ? di : len;
     chip_idle();
-    return status;
+    return abort || status < 0 ? DF_PHASE : status;
 busfail:
-    chip_idle();
+    /* the target never dropped REQ for our ACK: if it still holds the bus, free it */
+    if (CHIP(R_CSBS) & CSBS_BSY) bus_reset(); else chip_idle();
     *actual = di < len ? di : len;
-    return -1;
+    return DF_BUS;
+reset:
+    bus_reset();
+    *actual = di < len ? di : len;
+    return DF_PHASE;
 }
 
 
 /* the bus for one command: the port is SCSI for its length, then IDE again.
  * No Forbid(): nothing but this driver touches the port (it owns scsi.device
  * too), and the waits may sleep. The byte bursts run with interrupts off. */
-static int scsi_do(int id, int lun, const UBYTE *cdb, int cdblen,
+static int scsi_do(struct DFUnit *un, const UBYTE *cdb, int cdblen,
                    UBYTE *data, ULONG len, int out, ULONG *actual)
 {
-    int st;
+    int st, id = un->id, lun = un->lun;
     ObtainSemaphore(&buslock);
     stats.cmds++;
     SEL_SCSI();
     DBG({ int k; dbg_s("scsi "); dbg_x(id, 1); dbg_c(' ');
           for (k = 0; k < cdblen; k++) dbg_x(cdb[k], 2);
           dbg_s(" len "); dbg_x(len, 8); dbg_s(out ? " out\r\n" : " in\r\n"); });
-    blockxfer = (cdb[0] == 0x08 || cdb[0] == 0x28 || cdb[0] == 0xa8 ||
-                 cdb[0] == 0x0a || cdb[0] == 0x2a || cdb[0] == 0xaa) && !(len & 511);
+    blockxfer = (UBYTE)block_run(un, cdb, cdblen, len);
     st = run_cmd(id, lun, cdb, cdblen, data, len, out, actual);
     DBG({ dbg_s("  -> "); dbg_x((ULONG)st, 8); dbg_s(" got "); dbg_x(*actual, 8); dbg_s("\r\n"); });
     chip_idle();
@@ -569,10 +726,8 @@ static int unit_cmd(struct DFUnit *un, const UBYTE *cdb, int cdblen, UBYTE *data
 {
     if (un->ide)
         return ide_cmd(un, cdb, cdblen, data, len, out, actual);
-    return scsi_do(un->id, un->lun, cdb, cdblen, data, len, out, actual);
+    return scsi_do(un, cdb, cdblen, data, len, out, actual);
 }
-
-static ULONG be32(const UBYTE *p) { return ((ULONG)p[0] << 24) | ((ULONG)p[1] << 16) | ((ULONG)p[2] << 8) | p[3]; }
 
 static int request_sense(struct DFUnit *un, UBYTE *buf, int len, ULONG *got)
 {
@@ -592,12 +747,28 @@ static int unit_probe(struct DFUnit *un)
     memset(cdb, 0, sizeof(cdb));
     cdb[0] = 0x12; cdb[4] = 36;
     st = unit_cmd(un, cdb, 6, inq, 36, 0, &got);
-    if (st < 0 && !un->ide)
+    if (st == -1 && !un->ide)
         return -1;                                    /* no target at that id */
     if (st < 0 || got < 5 || (inq[0] & 0xe0))        /* no device, or no LUN there */
         return 0;
     un->devtype = inq[0] & 0x1f;
     un->removable = (inq[1] & 0x80) != 0;
+    /* write protection (TD_PROTSTATUS): bit 7 of byte 2 of the MODE SENSE(6)
+     * header - page $3F, or page 0 for a drive that refuses "all pages"; a
+     * drive without MODE SENSE at all counts as writable, a CD-ROM never is.
+     * An ATA disk has no such bit (the translation says 0: no WP there
+     * unless a write fails with it, ide.c ata_fail). */
+    un->wp = un->devtype == 5;
+    if (!un->ide || un->atapi) {
+        UBYTE hdr[4];
+        for (i = 0; i < 2; i++) {
+            memset(cdb, 0, sizeof(cdb));
+            cdb[0] = 0x1a; cdb[2] = i ? 0x00 : 0x3f; cdb[4] = 4;
+            st = unit_cmd(un, cdb, 6, hdr, 4, 0, &got);
+            if (st == 0 && got >= 3) { if (hdr[2] & 0x80) un->wp = 1; break; }
+            if (st == 2) request_sense(un, sense_buf, 18, &got);
+        }
+    }
     for (i = 0; i < 3; i++) {
         memset(cdb, 0, sizeof(cdb));
         cdb[0] = 0x25;
@@ -611,9 +782,14 @@ static int unit_probe(struct DFUnit *un)
         if (st == 2)
             request_sense(un, sense_buf, 18, &got);     /* clears a unit attention */
     }
+    /* there, but no medium / not ready: the block size stays unknown (0)
+     * until a READ CAPACITY works - rw probes again on every request until
+     * then, and a medium change clears it (fire_change). 1.0.4 guessed 512
+     * here and never asked again, so a CD still spinning up at the open
+     * was read at 512-byte blocks for good: wrong sectors, status GOOD. */
     un->blocks = 0;
-    un->bsize = 512;
-    return 1;                                /* there, but no medium / not ready */
+    un->bsize = 0;
+    return 1;
 }
 
 /* ---- block transfers ---------------------------------------------------- */
@@ -640,26 +816,65 @@ static void count_size(ULONG len)
     stats.size[i]++;
 }
 
+static void fire_change(struct DFUnit *un);
+
+/* the io_Error for a READ/WRITE(10) that ended with CHECK CONDITION, from
+ * the sense key. A failed write is write protection only when the drive
+ * says DATA PROTECT; a failed read a bad sector only on MEDIUM ERROR. */
+static BYTE sense_error(struct DFUnit *un)
+{
+    switch (sense_buf[2] & 0x0f) {
+    case 0x02:                                    /* NOT READY: no medium, or still spinning up */
+        return un->removable || sense_buf[12] == 0x3a ? TDERR_DiskChanged : TDERR_NotSpecified;
+    case 0x03: return TDERR_BadSecSum;            /* MEDIUM ERROR */
+    case 0x05:                                    /* ILLEGAL REQUEST: LBA out of range */
+        return sense_buf[12] == 0x21 ? TDERR_SeekError : TDERR_NotSpecified;
+    case 0x06: return TDERR_DiskChanged;          /* UNIT ATTENTION */
+    case 0x07: return TDERR_WriteProt;            /* DATA PROTECT */
+    }
+    return TDERR_NotSpecified;
+}
+
 static void rw(struct IOStdReq *io, int out, int is64)
 {
     struct DFUnit *un = unit_of(io);
     ULONG hi = is64 ? io->io_Actual : 0, lo = io->io_Offset, len = io->io_Length, done = 0;
     ULONG bs, lba, nblk;
     UBYTE *data = io->io_Data;
+    int retried = 0;
 
     if (out) { stats.writes++; stats.wbytes += len; } else { stats.reads++; stats.rbytes += len; }
     count_size(len);
     io->io_Actual = 0;
     if (!un->bsize && unit_probe(un) <= 0) { io->io_Error = TDERR_DiskChanged; return; }
-    bs = un->bsize ? un->bsize : 512;
-    if ((lo % bs) || (len % bs)) { io->io_Error = IOERR_BADLENGTH; return; }
-    /* byte offset -> block: 64-bit, bs a power of two from 512 up */
-    {
+    if (!un->bsize) {                            /* still no capacity: no medium, or not ready yet */
+        io->io_Error = un->removable ? TDERR_DiskChanged : TDERR_NotSpecified;
+        return;
+    }
+    bs = un->bsize;
+    if (len % bs) { io->io_Error = IOERR_BADLENGTH; return; }
+    /* byte offset -> block, 64-bit: a shift for the usual power-of-two
+     * sizes, a division for the rest (520-byte array disks, 2352-byte CD
+     * sectors - the shift's floor(log2) put those on the wrong block).
+     * Whole blocks only, and the block must fit 32 bits. */
+    if (bs & (bs - 1)) {
+        unsigned long long off = ((unsigned long long)hi << 32) | lo, b = off / bs;
+        if (off % bs) { io->io_Error = IOERR_BADLENGTH; return; }
+        if (b >> 32) { io->io_Error = IOERR_BADADDRESS; return; }
+        lba = (ULONG)b;
+    } else {
         int sh = 0;
         ULONG b = bs;
         while (b > 1) { b >>= 1; sh++; }
+        if (lo % bs) { io->io_Error = IOERR_BADLENGTH; return; }
         lba = (lo >> sh) | (sh ? hi << (32 - sh) : 0);
         if (sh < 32 && (hi >> sh)) { io->io_Error = IOERR_BADADDRESS; return; }
+    }
+    /* past the end: refused before anything is sent (the drive's own
+     * ILLEGAL REQUEST came back as a bad sector / write protection) */
+    if (un->blocks && len && (lba >= un->blocks || len / bs > un->blocks - lba)) {
+        io->io_Error = TDERR_SeekError;
+        return;
     }
     while (done < len) {
         UBYTE cdb[10];
@@ -667,17 +882,28 @@ static void rw(struct IOStdReq *io, int out, int is64)
         int st;
         if (want > CHUNK && !(un->ide && !un->atapi)) want = CHUNK;   /* an IDE disk has no Forbid() */
         nblk = want / bs;
-        if (nblk > 0xffff) nblk = 0xffff, want = nblk * bs;
+        if (nblk > 0xffff) nblk = 0xffff;
+        want = nblk * bs;                        /* whole blocks: a chunk of 64 KB is not one on a 520-byte disk */
         cdb[0] = out ? 0x2a : 0x28; cdb[1] = 0;
         cdb[2] = (UBYTE)(lba >> 24); cdb[3] = (UBYTE)(lba >> 16); cdb[4] = (UBYTE)(lba >> 8); cdb[5] = (UBYTE)lba;
         cdb[6] = 0; cdb[7] = (UBYTE)(nblk >> 8); cdb[8] = (UBYTE)nblk; cdb[9] = 0;
         st = unit_cmd(un, cdb, 10, data + done, want, out, &got);
         if (st != 0) {
-            if (st == 2) request_sense(un, sense_buf, 18, &got);
-            io->io_Error = st < 0 ? TDERR_NotSpecified : (out ? TDERR_WriteProt : TDERR_BadSecSum);
-            if (st == 2 && (sense_buf[2] & 0x0f) == 0x06) { un->bsize = 0; un->changes++; io->io_Error = TDERR_DiskChanged; }
-            if (st == 2 && (sense_buf[2] & 0x0f) == 0x07) io->io_Error = TDERR_WriteProt;
-            if (st == 2 && (sense_buf[2] & 0x0f) == 0x03) io->io_Error = out ? TDERR_SeekError : TDERR_BadSecSum;
+            io->io_Error = TDERR_NotSpecified;       /* no target, a bus error, BUSY, RESERVATION CONFLICT, ... */
+            if (st == 2) {
+                memset(sense_buf, 0, sizeof(sense_buf));
+                if (request_sense(un, sense_buf, 18, &got) == 0)
+                    io->io_Error = sense_error(un);
+                if ((sense_buf[2] & 0x0f) == 0x06) {
+                    /* UNIT ATTENTION: a reset or a power glitch on a fixed disk -
+                     * send the chunk once more. A removable medium may have been
+                     * swapped: tell the change interrupts (the attention is used
+                     * up now, so the poller would not see it) and fail. */
+                    if (un->removable) { fire_change(un); un->medium = 1; }
+                    else if (!retried) { retried = 1; io->io_Error = 0; continue; }   /* a success after the retry is a success */
+                }
+            }
+            io->io_Actual = done;
             return;
         }
         done += got;
@@ -706,8 +932,10 @@ static void scsicmd(struct IOStdReq *io)
     sc->scsi_SenseActual = 0;
     io->io_Actual = sizeof(struct SCSICmd);
     if (st < 0) {
+        /* no target answered the selection; the data phase went wrong, the
+         * target ran out of time or lost the bus; the port's handshake failed */
         sc->scsi_Status = 0;
-        io->io_Error = HFERR_SelTimeout;
+        io->io_Error = st == DF_PHASE ? HFERR_Phase : st == DF_BUS ? HFERR_DMA : HFERR_SelTimeout;
         return;
     }
     sc->scsi_Status = (UBYTE)st;
@@ -729,7 +957,7 @@ static void geometry(struct IOStdReq *io)
     if (io->io_Length < sizeof(struct DriveGeometry)) { io->io_Error = IOERR_BADLENGTH; return; }
     if (!un->bsize || !un->blocks) unit_probe(un);
     memset(dg, 0, sizeof(*dg));
-    dg->dg_SectorSize = un->bsize ? un->bsize : 512;
+    dg->dg_SectorSize = un->bsize ? un->bsize : 512;     /* no medium: a size for the caller's sums only (0 sectors) */
     dg->dg_TotalSectors = un->blocks;
     if (un->ide && !un->atapi) {
         dg->dg_Heads = un->heads;
@@ -763,7 +991,7 @@ static int needs_task(UWORD cmd)
     case CMD_READ: case CMD_WRITE: case TD_FORMAT: case TD_READ64: case TD_WRITE64: case TD_FORMAT64:
     case NSCMD_TD_READ64: case NSCMD_TD_WRITE64: case NSCMD_TD_FORMAT64: case HD_SCSICMD:
     case TD_GETGEOMETRY: case TD_CHANGESTATE: case TD_EJECT: case TD_MOTOR: case CMD_UPDATE:
-    case 0x7ff3:
+    case CMD_RESET: case 0x7ff3:
         return 1;
     }
     return 0;
@@ -806,11 +1034,17 @@ static void perform(struct IOStdReq *io)
     case TD_MOTOR:
         io->io_Actual = 1;
         break;
-    case CMD_UPDATE: {                          /* the drive's write cache, if it has one */
+    case CMD_UPDATE: {
+        /* the drive's write cache, if it has one: SYNCHRONIZE CACHE (an ATA
+         * disk: FLUSH CACHE when IDENTIFY lists it, ide.c). Removable units
+         * too - CF cards and Microdrives say removable, and a Microdrive
+         * has a real write cache; only a unit known to have no medium is
+         * skipped. A drive without the command answers ILLEGAL REQUEST:
+         * nothing to flush, the sense is cleared. */
         UBYTE cdb[10] = { 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         ULONG got;
-        if (!un->removable && unit_cmd(un, cdb, 10, NULL, 0, 0, &got) == 2)
-            request_sense(un, sense_buf, 18, &got);  /* an old drive without it: fine */
+        if (!(un->removable && un->medium == 2) && unit_cmd(un, cdb, 10, NULL, 0, 0, &got) == 2)
+            request_sense(un, sense_buf, 18, &got);
         io->io_Actual = 0;
         break;
     }
@@ -825,7 +1059,23 @@ static void perform(struct IOStdReq *io)
         io->io_Actual = 16;
         break;
     }
-    case CMD_RESET: case CMD_CLEAR: case CMD_STOP: case CMD_START: case CMD_FLUSH:
+    case CMD_RESET:
+        /* the way out of a hung bus a program has (HDToolBox, a file system
+         * after errors): RST on the SCSI bus, and the unit's cached state goes
+         * so the next request reads the capacity again. Every target on the
+         * bus reports a UNIT ATTENTION afterwards (rw retries for it). The
+         * IDE port has no reset here yet (audit L6). */
+        if (!un->ide) {
+            ObtainSemaphore(&buslock);
+            SEL_SCSI();
+            bus_reset();
+            SEL_IDE();
+            ReleaseSemaphore(&buslock);
+        }
+        if (!un->ide || un->atapi) un->bsize = 0;
+        io->io_Actual = 0;
+        break;
+    case CMD_CLEAR: case CMD_STOP: case CMD_START: case CMD_FLUSH:
     case TD_SEEK: case TD_SEEK64: case NSCMD_TD_SEEK64: case TD_REMOVE:
         io->io_Actual = 0;
         break;
@@ -853,7 +1103,7 @@ static void perform(struct IOStdReq *io)
         break;
     }
     case TD_CHANGENUM:      io->io_Actual = un->changes; break;
-    case TD_PROTSTATUS:     io->io_Actual = 0; break;
+    case TD_PROTSTATUS:     io->io_Actual = un->wp; break;      /* from the last probe (every medium change probes again) */
     case TD_GETDRIVETYPE:   io->io_Actual = DRIVE3_5; break;
     case TD_GETNUMTRACKS:   io->io_Actual = un->blocks / 32; break;
     case 0x7ff3:            /* DF_IRQPROBE */
@@ -905,19 +1155,24 @@ static int medium_in(struct DFUnit *un)
      * once the new disc is loaded), so an attention alone counts only when
      * nothing was reported in the last poll interval. */
     if ((UBYTE)(in ? 1 : 2) != un->medium || (ua && !un->quiet)) {
-        if (un->medium || ua) {                 /* not the first look */
-            struct Node *n;
-            un->changes++;
-            un->bsize = 0;                      /* READ CAPACITY again: a new disc */
-            un->quiet = 2;
-            Forbid();
-            for (n = un->chgints.lh_Head; n->ln_Succ; n = n->ln_Succ)
-                Cause((struct Interrupt *)((struct IOStdReq *)n)->io_Data);
-            Permit();
-        }
+        if (un->medium || ua)                   /* not the first look */
+            fire_change(un);
         un->medium = in ? 1 : 2;
     }
     return in;
+}
+
+/* a medium change: count it, read the capacity again, tell the change interrupts */
+static void fire_change(struct DFUnit *un)
+{
+    struct Node *n;
+    un->changes++;
+    un->bsize = 0;                              /* READ CAPACITY again: a new disc */
+    un->quiet = 2;
+    Forbid();
+    for (n = un->chgints.lh_Head; n->ln_Succ; n = n->ln_Succ)
+        Cause((struct Interrupt *)((struct IOStdReq *)n)->io_Data);
+    Permit();
 }
 
 /* every POLL_SECS: each removable unit somebody wants change news about */
@@ -1096,6 +1351,11 @@ void df_open(REG(a1, struct IOStdReq *io), REG(d0, ULONG unitnum), REG(d1, ULONG
     int id = unitnum % 10, lun = unitnum / 10;
 
     dev->dd_Library.lib_OpenCnt++;          /* no expunge while we may Wait() */
+    /* one open at a time: starting the task and probing a new unit both
+     * Wait(), which breaks exec's Forbid - two first opens at once got two
+     * unit structures (one orphaned: TDERR_BadUnitNum) and could AddTask
+     * the same task twice */
+    ObtainSemaphore(&openlock);
     io->io_Error = IOERR_OPENFAIL;
     if (!start_task()) goto out;
     /* the port is ours from the first open on: before it is ever switched */
@@ -1130,6 +1390,7 @@ opened:
     dev->dd_Library.lib_OpenCnt++;
     dev->dd_Library.lib_Flags &= ~LIBF_DELEXP;
 out:
+    ReleaseSemaphore(&openlock);
     dev->dd_Library.lib_OpenCnt--;
 }
 
@@ -1214,11 +1475,12 @@ struct Device *df_init(REG(d0, BPTR seg))
     if (!dev) return NULL;
     seglist = seg;
     InitSemaphore(&buslock);
+    InitSemaphore(&openlock);
     dev->dd_Library.lib_Node.ln_Type = NT_DEVICE;
     dev->dd_Library.lib_Node.ln_Name = (char *)df_devname;
     dev->dd_Library.lib_Flags = LIBF_SUMUSED | LIBF_CHANGED;
     dev->dd_Library.lib_Version = 1;
-    dev->dd_Library.lib_Revision = 4;
+    dev->dd_Library.lib_Revision = 5;
     dev->dd_Library.lib_IdString = (APTR)df_idstring;
     dfdev = dev;
     AddDevice(dev);

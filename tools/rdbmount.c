@@ -24,7 +24,7 @@ extern struct ExecBase *SysBase;
 extern struct DosLibrary *DOSBase;
 struct ExpansionBase *ExpansionBase;
 
-static const char ver[] __attribute__((used)) = "$VER: RDBMount 1.0.4 (30.10.2026) DataFlyerSCSI";
+static const char ver[] __attribute__((used)) = "$VER: RDBMount 1.0.5 (31.10.2026) DataFlyerSCSI";
 static int quiet;
 #define RM_PRINTF if (!quiet) printf
 #include "rdbmountcore.h"

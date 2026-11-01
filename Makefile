@@ -4,7 +4,7 @@ CC      = m68k-amigaos-gcc
 CFLAGS  = -m68000 -Os -noixemul -Wall -Wno-pointer-sign -fomit-frame-pointer $(if $(DEBUG),-DDFDEBUG)
 OUT     = out
 
-all: $(OUT)/dataflyer.device $(OUT)/flyprobe $(OUT)/flytest $(OUT)/flystat $(OUT)/devlist $(OUT)/fcmp $(OUT)/flyread $(OUT)/rdbfix $(OUT)/RDBMount $(OUT)/tick $(OUT)/flychange $(OUT)/flyirq
+all: $(OUT)/dataflyer.device $(OUT)/flyprobe $(OUT)/flytest $(OUT)/flystat $(OUT)/devlist $(OUT)/fcmp $(OUT)/flyread $(OUT)/rdbfix $(OUT)/RDBMount $(OUT)/tick $(OUT)/flychange $(OUT)/flyirq $(OUT)/flysuite $(OUT)/volunit
 
 # 68020: the DataFlyer 1200 only fits the A1200 (68EC020 and up) - hardware divide
 $(OUT)/dataflyer.device: dev/start.S dev/dataflyer.c dev/ide.c dev/dataflyer.h
@@ -57,3 +57,13 @@ $(OUT)/flychange: tools/flychange.c
 $(OUT)/flyirq: tools/flyirq.c
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -s -o $@ $<
+
+# DriveTests: the driver + unit behind a drawer, for RunTests
+$(OUT)/volunit: tools/volunit.c
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -s -o $@ $<
+
+# 68020: flysuite runs where the driver runs (A1200)
+$(OUT)/flysuite: tools/flysuite.c
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -m68020 -s -o $@ $<

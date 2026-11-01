@@ -95,6 +95,7 @@ Amiga so the files get real protection bits.
 | `devlist` | Every mounted DOS device with its exec device, unit, BufMemType, MaxTransfer and Mask. |
 | `fcmp <path1> <path2>` | Compares two files, or two drawers with everything in them. |
 | `flyread UNIT=n [DEVICE=x] [LBA=n] [BLOCKS=n] [BSIZE=n]` | One READ(10) and one CMD_READ, with what came back. |
+| `flysuite UNIT=n [TESTS=...] ...` | The all-in-one test: HD_SCSICMD conformance, big and edge requests, concurrency, SCSI+IDE mixes, a soak, the Toolbox, a fuzzer for emulators, the audit checks. Every wait bounded. See [docs/flysuite.md](docs/flysuite.md). |
 | `tick SET` / `tick label BYTES=n` | Times script steps and prints KB/s. |
 
 ## Testing

@@ -1,0 +1,200 @@
+DriveTests - stress tests for Amiga disk drivers and file systems
+==================================================================
+
+Three tools that look at a drive from three levels:
+
+  flysuite   the DRIVER: it drives a unit of any trackdisk-style device
+             driver (CMD_READ, TD64, NSD, HD_SCSICMD) and checks every
+             answer. Written for an NCR 53C80 SCSI driver, usable on any
+             driver: DEVICE= and a unit.
+  AmiFSX     the FILES: a port of fsx, the file system exerciser from
+             NeXT/Apple still used by FreeBSD and xfstests. It keeps a
+             model of a test file and hammers the real one with random
+             reads, writes, size changes and reopens, checking every byte.
+  AmiDefrag  the STRUCTURES ON DISK: its analyse mode walks the file
+             system's own bitmap, directories and file headers (FFS,
+             PFS3, SFS) and maps every block - free, data, system,
+             unknown. Run it after the other two: damage that neither a
+             driver check nor a file check can see (a cross-linked block,
+             a bitmap out of step) shows up here. Its block layer is
+             read-only until the defragmenter is deliberately armed; this
+             kit only recommends the analyse pass.
+
+A driver bug then shows up at the level it lives at: a wrong error code
+or a dropped byte in flysuite, a corrupted file in AmiFSX, a damaged
+structure in AmiDefrag. All three need AmigaOS 2.04 or newer; flysuite
+and AmiFSX run on a 68000.
+
+In this drawer
+  flysuite        the driver test (flysuite.md: every option and check)
+  AmiFSX          the file system exerciser (AmiFSX.md)
+  AmiDefrag       the block-map analyser (AmiDefrag.md) - version 0.3,
+                  by John Hertell (director) and Claude Code (code);
+                  the defrag engines are beta, the analyse mode is what
+                  you want here. NOTE: in our tests (OS 3.2.3, FFS, a
+                  real A1200 and WinUAE) 0.3 printed its map in full and
+                  then REBOOTED the machine on exit. RunTests therefore
+                  skips it unless you add AMIDEFRAG; run it by hand on a
+                  machine with nothing unsaved. Reported upstream.
+  RAD-FFS         a mountlist for a RAD: FFS volume, a harmless first
+                  target for AmiFSX
+  LICENSE         GPL-3.0 for flysuite and AmiFSX (github.com/lainejones)
+  LICENSE-AmiDefrag  MIT (github.com/ChuckyGang/AmiDefrag)
+
+
+Running it
+----------
+From Workbench: double-click RunTests. It asks for a SCRATCH drawer on
+the drive to test (a file requester), works out the drive's device driver
+and unit from it, then asks Quick or Full:
+  Quick  reads only, writes nothing: flysuite's conf/big/edge/audit
+  Full   also writes test files in that drawer (made, checked and deleted
+         again) and runs AmiFSX there
+(the AmiDefrag analysis only with AMIDEFRAG on the Shell line - see above)
+The output shows in its window, every log is saved in the drawer
+(flysuite.log, amifsx.log, amidefrag.log), and a requester at the end
+says how it went. From a Shell the same, from inside this drawer:
+  CD Work:DriveTests
+  Execute RunTests Work:tests Full
+with the answers given (left out, it asks). A SCSI bus with a network
+adapter on it (a DaynaPORT emulation on a BlueSCSI/ZuluSCSI, say) needs
+that id kept out of the probes - flysuite's absent-id checks would send
+it INQUIRY and TEST UNIT READY while the network driver is using it:
+  Execute RunTests Work:tests Quick SKIPIDS=5
+(from the icon the script asks for no ids; use the Shell form then). The tools can also be run one by one (below).
+
+From a PC: these run on the Amiga, not on the PC. Get the drawer onto the
+Amiga whole (LhA on the Amiga keeps the executable bits; unpacked on a
+PC and copied over, the bits are lost - RunTests puts them back, a Shell
+user does `Protect flysuite +e` and the same for AmiFSX, AmiDefrag and
+volunit). In an emulator (WinUAE, Copperline) with the drawer in a host
+folder it runs the same way, against the emulated drive - fine for a
+driver that runs in the emulator, no use for one that only exists on
+real hardware.
+
+If it crashes
+-------------
+flysuite itself does not freeze a machine: every wait is bounded and a
+request that never comes back is reported as HANG. A driver can still
+take the machine down (a Guru, or a reset with nothing on screen). Then:
+  - reboot; a volume that was being written validates itself (FFS shows
+    it busy for a while) - that is normal
+  - read flysuite.log in the scratch drawer: it is written line by line,
+    so the last line names the test that was running when the machine
+    went down. That line is the report.
+  - Full mode leaves test files behind (flysuite.* and fsxtest* in the
+    scratch drawer): delete them.
+  - a RAWWRITE range (an option you gave by hand; RunTests uses none)
+    keeps its saved copy in RAM, so after a crash the range holds test
+    data. The tool only accepts a range outside every partition and
+    mounted volume, so that is unused space, not your files.
+  - AmiDefrag's analysis and AmiFSX in Quick mode write nothing.
+A crash in Quick mode is a driver finding in itself: say which test.
+
+
+The three in order, on a scratch volume (by hand)
+-------------------------------------------------
+  flysuite DEVICE=yourscsi.device UNIT=0 TESTS=all WRITEFILE=Scratch:t
+  AmiFSX Scratch:fsxtest N=100000 P=5000 C=100 XREAD
+  AmiDefrag Scratch: MAP WIDTH=72
+
+and read the AmiDefrag map for anything "unknown".
+
+
+flysuite - first run, read-only
+-------------------------------
+  flysuite DEVICE=yourscsi.device UNIT=0 TESTS=conf,big,edge,audit
+
+Nothing is written. Every wait is bounded: a request that never comes
+back is reported as HANG with the command that caused it, and the run
+ends with a summary instead of a frozen machine. Return code 0 = all
+passed, 5 = a FAIL, 10 = a HANG, 20 = refused.
+
+Writing needs an explicit option:
+  WRITEFILE=Scratch:dir     file writes in that drawer (made, verified,
+                            deleted again)
+  RAWWRITE=first,count      raw block writes ONLY in that range (max 1 MB);
+                            the blocks are saved first and restored at
+                            the end and on every error path. A range over
+                            an RDB, a partition or a mounted volume is
+                            refused.
+
+The groups (TESTS=): conf (HD_SCSICMD conformance), big (1-2048 block
+reads through every path, across 2/4 GB), edge (end of unit, odd
+lengths, the trackdisk queries, open/close), conc (several tasks at
+once + AbortIO), soak (MINUTES= of write/read/compare), mix (every
+SCSI/IDE read+write combination at once, for two-port drivers), audit
+(one test per finding of a 53C80 driver audit: error codes, data
+direction mismatches, byte-1 rewriting, first-open race, ATAPI
+direction), fuzz (random non-write CDBs, emulator only). `all` = what is
+safe without extra options. Two tests can wedge a machine and need DANGER
+(ATAPIDIR, RUNEND): emulator, own boot.
+
+What the audit tests look for in a driver:
+  ERRMAP   reads past the end fail with a seek / not-specified error,
+           not "bad sector" or "write protected"
+  DIRMIS   a data phase against the caller's direction flag, or past
+           its buffer, must not invent bytes: no zeros to the disk,
+           scsi_Actual = bytes really moved. Run this one: a 53C80 phase
+           loop gets it wrong easily, ours did.
+  CDBPASS  byte 1 of a LUN 0 command reaches the target untouched
+  RACEOPEN several first OpenDevice calls at once share one unit
+  ATAPIDIR an ATAPI command without SCSIF_READ must not loop forever
+
+A FAIL is the driver's; "the TARGET sends less than its header says"
+is the drive's and counts as a pass.
+
+
+AmiFSX - first run
+------------------
+  Mount RAD: FROM RAD-FFS        (a 2 MB FFS volume in RAM, optional)
+  AmiFSX RAD:fsxtest N=20000 P=1000
+
+then on the drive under test:
+
+  AmiFSX DH1:fsxtest N=100000 P=5000 C=100 XREAD
+
+N= operations (0 = forever, Ctrl-C stops), P= progress every N ops,
+C= close/reopen 1 in N ops, XREAD = a second handle for half the reads
+(cache coherency), CHIP = buffers in chip RAM (DMA paths), STRICT =
+extended space must read as zeroes. On the first mismatch it dumps the
+last 1024 operations and keeps the expected content next to the file.
+Return code 0 passed, 10 failure. Same SEED = same run.
+
+
+With an AI
+----------
+Give Claude (claude.ai, or Claude Code in your driver's repository) the
+flysuite.log and your driver source and ask what failed and why: one line
+per check with the command and the expected/got values is what it needs,
+and flysuite.md explains every check. The repository
+github.com/lainejones/DriveTests has a CLAUDE.md for coding agents: what
+the tools are, the order to run them, where to put the log, how to read a
+FAIL, a HANG or a crash, and to reproduce before fixing.
+
+
+Reporting
+---------
+flysuite: the LOG=file (every line, flushed as it goes) and the summary;
+SEED= repeats a run. AmiFSX: the operation dump and the seed.
+Issues: github.com/lainejones/DriveTests (the kit, RunTests, volunit),
+github.com/lainejones/DataFlyerSCSI (flysuite) and
+github.com/lainejones/AmiFSX.
+
+
+Credits
+-------
+  flysuite, volunit, RunTests   Laine Jones, for the DataFlyerSCSI driver
+                                (GPL-3.0)
+  AmiFSX                        Laine Jones's port of fsx, the file system
+                                exerciser by Avadis Tevanian Jr. (NeXT) and
+                                Apple, as carried on in FreeBSD, xfstests
+                                and LTP (GPL-3.0 for the port)
+  AmiDefrag 0.3                 John Hertell (director) and Claude Code
+                                (code), github.com/ChuckyGang/AmiDefrag
+                                (MIT, LICENSE-AmiDefrag) - thanks for a
+                                block-map analyser that reads FFS, PFS3
+                                and SFS alike
+  luVWagn                       whose CSA Twelve Gauge driver work is the
+                                reason the kit runs on any driver, not
+                                just ours

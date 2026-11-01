@@ -6,6 +6,7 @@
  */
 #include <exec/memory.h>
 #include <exec/io.h>
+#include <devices/trackdisk.h>
 #include <dos/dosextens.h>
 #include <dos/filehandler.h>
 #include <libraries/expansion.h>
@@ -29,6 +30,23 @@ static LONG rm_read(struct ExecBase *SysBase, struct IOStdReq *io,
     return DoIO((struct IORequest *)io);
 }
 
+/* the unit's block size (TD_GETGEOMETRY), 512 when the driver has none;
+ * the RDSK search reads blocks of this size (a 2048-byte MO or CD-ROM
+ * refuses 512-byte reads), and the buffer is this big */
+static ULONG rm_blocksize(struct ExecBase *SysBase, struct IOStdReq *io)
+{
+    struct DriveGeometry dg;
+    ULONG bs;
+    io->io_Command = TD_GETGEOMETRY;
+    io->io_Data    = &dg;
+    io->io_Length  = sizeof(dg);
+    io->io_Offset  = 0;
+    if (DoIO((struct IORequest *)io) != 0) return 512;
+    bs = dg.dg_SectorSize;
+    if (bs < 256 || bs > 4096 || (bs & (bs - 1))) return 512;
+    return bs;
+}
+
 /* returns number of partitions mounted, -1 = no RDSK on unit */
 static LONG rm_mount_unit(struct ExecBase *SysBase, struct DosLibrary *DOSBase,
                           struct ExpansionBase *ExpansionBase,
@@ -38,7 +56,7 @@ static LONG rm_mount_unit(struct ExecBase *SysBase, struct DosLibrary *DOSBase,
     struct IOStdReq *io;
     UBYTE *buf;
     LONG found = -1, mounted = 0;
-    ULONG blocksize = 512, partlist = 0xFFFFFFFF;
+    ULONG blocksize, bufsize, partlist = 0xFFFFFFFF;
     ULONG i;
 
     port = CreateMsgPort();
@@ -49,14 +67,18 @@ static LONG rm_mount_unit(struct ExecBase *SysBase, struct DosLibrary *DOSBase,
         DeleteIORequest((struct IORequest *)io); DeleteMsgPort(port);
         return -2;
     }
-    buf = AllocMem(1024, MEMF_PUBLIC | MEMF_CLEAR);
+    /* the buffer holds one block of the unit's size; every read into it is
+     * that size or less (a 1024-byte buffer overflowed on 2048- and
+     * 4096-byte-block RDBs). The fields read below all lie within 256 bytes. */
+    bufsize = blocksize = rm_blocksize(SysBase, io);
+    buf = AllocMem(bufsize, MEMF_PUBLIC | MEMF_CLEAR);
     if (buf) {
         /* find RDSK in blocks 0..15 */
         for (i = 0; i < 16; i++) {
-            if (rm_read(SysBase, io, buf, i, 512) != 0) continue;
+            if (rm_read(SysBase, io, buf, i, blocksize) != 0) continue;
             if (rm_long(buf) == RDSK_ID) {
                 blocksize = rm_long(buf + 16);
-                if (blocksize < 256 || blocksize > 4096) blocksize = 512;
+                if (blocksize < 256 || blocksize > bufsize) blocksize = bufsize;
                 partlist = rm_long(buf + 28);
                 found = 0;
                 break;
@@ -130,7 +152,7 @@ static LONG rm_mount_unit(struct ExecBase *SysBase, struct DosLibrary *DOSBase,
                 FreeMem(packet, (tabsize + 1 + 4) * 4);
             }
         }
-        FreeMem(buf, 1024);
+        FreeMem(buf, bufsize);
     }
     CloseDevice((struct IORequest *)io);
     DeleteIORequest((struct IORequest *)io);

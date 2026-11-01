@@ -1,0 +1,15 @@
+Device = ramdrive.device
+Unit = 0
+Flags = 0
+Surfaces = 2
+SectorsPerTrack = 11
+SectorSize = 512
+Reserved = 2
+Interleave = 0
+LowCyl = 0
+HighCyl = 79
+Buffers = 20
+BufMemType = 1
+DosType = 0x444F5301
+GlobVec = -1
+Activate = 1

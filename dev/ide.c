@@ -97,13 +97,17 @@ static void set_sense(struct DFUnit *un, UBYTE key, UBYTE asc, UBYTE ascq)
     un->skey = key; un->asc = asc; un->ascq = ascq;
 }
 
-/* an ATA command ended with ERR / DF / a timeout: sense for it */
-static void ata_fail(struct DFUnit *un, UBYTE s)
+/* an ATA command ended with ERR / DF / a timeout: sense for it. Error bit 6
+ * is UNC on a read but WP (write protected, removable media) on a write;
+ * bit 1 is NM (no media) */
+static void ata_fail(struct DFUnit *un, UBYTE s, int out)
 {
     UBYTE e;
     if (s == 0xff) { set_sense(un, 0x04, 0x44, 0x00); return; }       /* HARDWARE ERROR: timeout */
     e = IDE(I_ERR);
-    if (e & 0x40)      set_sense(un, 0x03, 0x11, 0x00);                /* uncorrectable read error */
+    if ((e & 0x40) && out) set_sense(un, 0x07, 0x27, 0x00);            /* DATA PROTECT: the drive says WP */
+    else if (e & 0x40) set_sense(un, 0x03, 0x11, 0x00);                /* uncorrectable read error */
+    else if ((e & 0x02) && un->removable) set_sense(un, 0x02, 0x3a, 0x00);  /* NOT READY: no medium */
     else if (e & 0x10) set_sense(un, 0x05, 0x21, 0x00);                /* LBA out of range */
     else if (e & 0x04) set_sense(un, 0x0b, 0x00, 0x00);                /* aborted command */
     else               set_sense(un, 0x04, 0x00, 0x00);
@@ -121,7 +125,7 @@ static ULONG ata_xfer(struct DFUnit *un, ULONG lba, ULONG nblk, UBYTE *buf, int 
         UBYTE s, cmd;
         if (ext) {
             s = select_drive(un, 0x40);
-            if (s == 0xff) { ata_fail(un, s); break; }
+            if (s == 0xff) { ata_fail(un, s, out); break; }
             IDE(I_COUNT) = (UBYTE)(n >> 8);
             IDE(I_LBA0) = (UBYTE)(lba >> 24); IDE(I_LBA1) = 0; IDE(I_LBA2) = 0;
             IDE(I_COUNT) = (UBYTE)n;
@@ -129,14 +133,14 @@ static ULONG ata_xfer(struct DFUnit *un, ULONG lba, ULONG nblk, UBYTE *buf, int 
             cmd = out ? 0x34 : 0x24;
         } else if (un->lba) {
             s = select_drive(un, (UBYTE)(0x40 | ((lba >> 24) & 0x0f)));
-            if (s == 0xff) { ata_fail(un, s); break; }
+            if (s == 0xff) { ata_fail(un, s, out); break; }
             IDE(I_COUNT) = (UBYTE)n;                    /* 256 -> 0 */
             IDE(I_LBA0) = (UBYTE)lba; IDE(I_LBA1) = (UBYTE)(lba >> 8); IDE(I_LBA2) = (UBYTE)(lba >> 16);
             cmd = out ? 0x30 : 0x20;
         } else {                                        /* an old drive: cylinder/head/sector */
             ULONG hs = (ULONG)un->heads * un->secs, c = lba / hs, r = lba % hs;
             s = select_drive(un, (UBYTE)(r / un->secs));
-            if (s == 0xff) { ata_fail(un, s); break; }
+            if (s == 0xff) { ata_fail(un, s, out); break; }
             IDE(I_COUNT) = (UBYTE)n;
             IDE(I_LBA0) = (UBYTE)(r % un->secs + 1);
             IDE(I_LBA1) = (UBYTE)c; IDE(I_LBA2) = (UBYTE)(c >> 8);
@@ -146,14 +150,14 @@ static ULONG ata_xfer(struct DFUnit *un, ULONG lba, ULONG nblk, UBYTE *buf, int 
         pause400();
         for (i = 0; i < n; i++) {
             s = wait_ready(T_BUSY);
-            if (s == 0xff || (s & (ST_ERR | ST_DF)) || !(s & ST_DRQ)) { ata_fail(un, s); return done; }
+            if (s == 0xff || (s & (ST_ERR | ST_DF)) || !(s & ST_DRQ)) { ata_fail(un, s, out); return done; }
             if (out) df_ideout(buf); else df_idein(buf);
             buf += 512;
             done++;
         }
         if (out) {
             s = wait_ready(T_BUSY);
-            if (s == 0xff || (s & (ST_ERR | ST_DF))) { ata_fail(un, s); return done - n; }
+            if (s == 0xff || (s & (ST_ERR | ST_DF))) { ata_fail(un, s, out); return done - n; }
         }
         lba += n;
         nblk -= n;
@@ -161,14 +165,18 @@ static ULONG ata_xfer(struct DFUnit *un, ULONG lba, ULONG nblk, UBYTE *buf, int 
     return done;
 }
 
+/* FLUSH CACHE (EXT), when IDENTIFY says the drive has it; a drive
+ * without it has nothing to flush. 1 = done or nothing to do */
 static int ata_flush(struct DFUnit *un)
 {
-    UBYTE s = select_drive(un, 0);
+    UBYTE s;
+    if (!un->flush) return 1;
+    s = select_drive(un, 0);
     if (s == 0xff) return 0;
-    IDE(I_CMD) = un->lba48 ? 0xea : 0xe7;              /* FLUSH CACHE (EXT) */
+    IDE(I_CMD) = un->flush == 2 ? 0xea : 0xe7;
     pause400();
     s = wait_ready(T_BUSY);
-    return s != 0xff && !(s & ST_ERR);                 /* an old drive without it: ERR, nothing to flush */
+    return s != 0xff && !(s & ST_ERR);
 }
 
 /* ---- ATA: the SCSI commands a file system / HDToolBox send -------------- */
@@ -176,13 +184,19 @@ static int ata_flush(struct DFUnit *un)
 static void put3(UBYTE *p, ULONG v) { p[0] = (UBYTE)(v >> 16); p[1] = (UBYTE)(v >> 8); p[2] = (UBYTE)v; }
 static void put4(UBYTE *p, ULONG v) { p[0] = (UBYTE)(v >> 24); put3(p + 1, v); }
 
-static int ata_scsi(struct DFUnit *un, const UBYTE *c, UBYTE *data, ULONG len, ULONG *actual)
+static int ata_scsi(struct DFUnit *un, const UBYTE *c, UBYTE *data, ULONG len, int out, ULONG *actual)
 {
+    static UBYTE bounce[512];        /* the part of a sector that fits a short buffer (under the bus lock) */
     UBYTE tmp[64];                   /* MODE SENSE all pages: header 4 + descriptor 8 + 2 pages of 24 */
-    ULONG lba, n, got;
-    int i;
+    ULONG lba, n, got, whole, rest;
+    int i, wr;
 
     *actual = 0;
+    /* data the drive would send to a caller that said write: refused, as
+     * the SCSI side aborts it (HFERR_Phase) */
+    if (out && len && (c[0] == 0x03 || c[0] == 0x12 || c[0] == 0x25 || c[0] == 0x1a ||
+                       c[0] == 0x08 || c[0] == 0x28))
+        return DF_PHASE;
     switch (c[0]) {
     case 0x00: case 0x1b: case 0x1e: case 0x2f:     /* TEST UNIT READY, START STOP, PREVENT, VERIFY */
         break;
@@ -257,10 +271,20 @@ static int ata_scsi(struct DFUnit *un, const UBYTE *c, UBYTE *data, ULONG len, U
         n = ((ULONG)c[7] << 8) | c[8];
     rw:
         if (lba >= un->blocks || n > un->blocks - lba) { set_sense(un, 0x05, 0x21, 0x00); return 2; }
-        if (n * 512 > len) n = len / 512;
-        got = ata_xfer(un, lba, n, data, c[0] == 0x0a || c[0] == 0x2a);
+        wr = c[0] == 0x0a || c[0] == 0x2a;
+        /* a write goes only with all of its sectors from the caller: with
+         * SCSIF_READ, or a buffer shorter than the count, nothing is written */
+        if (wr && n && (!out || n * 512 > len)) return DF_PHASE;
+        whole = n; rest = 0;
+        if (!wr && n * 512 > len) { whole = len / 512; rest = len % 512; }
+        got = ata_xfer(un, lba, whole, data, wr);
         *actual = got * 512;
-        if (got < n) return 2;
+        if (got < whole) return 2;
+        if (rest) {                                  /* a read into a buffer that ends inside a sector */
+            if (ata_xfer(un, lba + whole, 1, bounce, 0) != 1) return 2;
+            memcpy(data + got * 512, bounce, rest);
+            *actual += rest;
+        }
         break;
     default:
     illegal:
@@ -272,13 +296,44 @@ static int ata_scsi(struct DFUnit *un, const UBYTE *c, UBYTE *data, ULONG len, U
 
 /* ---- ATAPI: the command block as a packet ------------------------------- */
 
+#define T_PACKET 21000000            /* 30 s in CIA reads for a whole packet command */
+#define T_JUNK   (1UL << 20)         /* at most 1 MB the caller has no room for, then the drive is reset */
+
+/* BSY clear and DRQ, ERR or the status phase (interrupt reason I/O + C/D;
+ * BSY can drop a moment before DRQ comes up for the data). It sleeps like
+ * every wait, out of *left, the command's budget. 0xff = out of time */
+static UBYTE atapi_wait(ULONG *left)
+{
+    ULONG n = 0, used;
+    UBYTE s;
+    for (;;) {
+        s = IDE(I_STAT);
+        if (!(s & ST_BSY) && ((s & (ST_DRQ | ST_ERR)) || (IDE(I_COUNT) & 3) == 3)) {
+            stats.polls[W_IDE] += n;
+            return s;
+        }
+        used = df_pause(n++);
+        if (used >= *left) { *left = 0; stats.polls[W_IDE] += n; stats.timeouts++; return 0xff; }
+        *left -= used;
+    }
+}
+
+/* DEVICE RESET: a packet device takes it with BSY or DRQ up - the way out
+ * of a command that can't go on (or did not end in time) */
+static void atapi_reset(void)
+{
+    IDE(I_CMD) = 0x08;
+    pause400();
+    wait_ready(T_BUSY);
+}
+
 static int atapi_cmd(struct DFUnit *un, const UBYTE *cdb, int cdblen, UBYTE *data, ULONG len, int out,
                      ULONG *actual)
 {
     UBYTE pkt[12];
-    ULONG done = 0;
+    ULONG done = 0, junk = 0, left = T_PACKET;
     UBYTE s;
-    int i;
+    int i, bad = 0;
 
     *actual = 0;
     memset(pkt, 0, sizeof(pkt));
@@ -293,41 +348,57 @@ static int atapi_cmd(struct DFUnit *un, const UBYTE *cdb, int cdblen, UBYTE *dat
     if (s == 0xff || !(s & ST_DRQ)) return -1;
     for (i = 0; i < 12; i += 2)
         IDE_DATA = (UWORD)((pkt[i] << 8) | pkt[i + 1]);
+    /* The direction is the device's, from the interrupt reason (I/O = 1:
+     * to the host), never the caller's flag: 1.0.4 read the data port while
+     * the device waited for data (or the other way round) and went round
+     * forever. Every wait is out of one 30 s budget. */
     for (;;) {
-        ULONG cnt, k, t;
+        ULONG cnt, k;
+        UBYTE ir;
         pause400();
-        /* the end is the status phase (interrupt reason I/O + C/D); BSY can
-         * drop a moment before DRQ comes up for the data */
-        for (t = T_BUSY; t; t--) {
-            s = wait_ready(T_BUSY);
-            if (s == 0xff) return -1;
-            if ((s & (ST_DRQ | ST_ERR)) || (IDE(I_COUNT) & 3) == 3) break;
-            (void)CIA_PRA;
-        }
-        if (!t) { stats.timeouts++; return -1; }
-        if (!(s & ST_DRQ)) break;
+        s = atapi_wait(&left);
+        if (s == 0xff) { atapi_reset(); return DF_PHASE; }   /* out of time mid-command (HFERR_Phase), not "no device" */
+        if (!(s & ST_DRQ)) break;                    /* the status phase: the end */
+        ir = IDE(I_COUNT) & 3;
         cnt = IDE(I_LBA1) | ((ULONG)IDE(I_LBA2) << 8);
-        /* whole sectors straight through; the rest (and what is past our buffer) a word at a time */
+        if (!cnt || (ir & 1)) { atapi_reset(); bad = 1; break; }   /* DRQ with no bytes, or for a packet again */
+        if (!(ir & 2)) {
+            /* the device wants data: only the caller's own bytes go - with
+             * SCSIF_READ, or more than its buffer holds, the packet is aborted */
+            if (!out || done > len || cnt > len - done) { atapi_reset(); bad = 1; break; }
+            while (cnt >= 512) { df_ideout(data + done); done += 512; cnt -= 512; }
+            for (k = 0; k < cnt; k += 2) {
+                UWORD w = (UWORD)(data[done] << 8);
+                if (k + 1 < cnt) w |= data[done + 1];
+                IDE_DATA = w;
+                done += (k + 1 < cnt) ? 2 : 1;
+            }
+            continue;
+        }
+        if (out && len) {
+            /* the device sends to a caller that said write: into a bit bucket, then an error */
+            bad = 1;
+            for (k = 0; k < cnt; k += 2) (void)IDE_DATA;
+            junk += cnt;
+            if (junk > T_JUNK) { atapi_reset(); break; }
+            continue;
+        }
+        /* whole sectors straight through; the rest (and what is past our buffer, dropped) a word at a time */
         while (cnt >= 512 && done + 512 <= len) {
-            if (out) df_ideout(data + done); else df_idein(data + done);
+            df_idein(data + done);
             done += 512;
             cnt -= 512;
         }
         for (k = 0; k < cnt; k += 2) {
-            UWORD w = 0;
-            if (out) {
-                if (done < len) w = (UWORD)(data[done] << 8);
-                if (done + 1 < len) w |= data[done + 1];
-                IDE_DATA = w;
-            } else {
-                w = IDE_DATA;
-                if (done < len) data[done] = (UBYTE)(w >> 8);
-                if (k + 1 < cnt && done + 1 < len) data[done + 1] = (UBYTE)w;
-            }
+            UWORD w = IDE_DATA;
+            if (done < len) data[done] = (UBYTE)(w >> 8);
+            if (k + 1 < cnt && done + 1 < len) data[done + 1] = (UBYTE)w;
             done += (k + 1 < cnt) ? 2 : 1;
         }
+        if (done > len && done - len > T_JUNK) { atapi_reset(); bad = 1; break; }
     }
     *actual = done < len ? done : len;
+    if (bad) return DF_PHASE;
     return (s & ST_ERR) ? 2 : 0;                     /* CHECK CONDITION: REQUEST SENSE for the rest */
 }
 
@@ -337,7 +408,7 @@ int ide_cmd(struct DFUnit *un, const UBYTE *cdb, int cdblen, UBYTE *data, ULONG 
     int st;
     ObtainSemaphore(&buslock);
     stats.cmds++;
-    st = un->atapi ? atapi_cmd(un, cdb, cdblen, data, len, out, actual) : ata_scsi(un, cdb, data, len, actual);
+    st = un->atapi ? atapi_cmd(un, cdb, cdblen, data, len, out, actual) : ata_scsi(un, cdb, data, len, out, actual);
     ReleaseSemaphore(&buslock);
     return st;
 }
@@ -397,6 +468,8 @@ static int ide_probe(struct DFUnit *un)
     un->cyl = id[1]; un->heads = id[3]; un->secs = id[6];
     un->lba = (id[49] & 0x0200) != 0;
     un->lba48 = (id[83] & 0xc400) == 0x4400;
+    if ((id[83] & 0xc000) == 0x4000)                 /* word 83 valid: bit 12 FLUSH CACHE, bit 13 FLUSH CACHE EXT */
+        un->flush = (id[83] & 0x2000) ? 2 : (id[83] & 0x1000) ? 1 : 0;
     if (un->lba48)
         un->blocks = (id[102] || id[103]) ? 0xffffffffUL : ((ULONG)id[101] << 16) | id[100];
     else if (un->lba)

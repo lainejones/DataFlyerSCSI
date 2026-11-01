@@ -35,9 +35,9 @@ _df_devname:
 
     .globl  _df_idstring
 _df_idstring:
-    .ascii  "dataflyer.device 1.0.4 (30.10.2026)"
+    .ascii  "dataflyer.device 1.0.5 (31.10.2026)"
     .byte   13,10,0
-    .ascii  "$VER: dataflyer.device 1.0.4 (30.10.2026) DataFlyer 1200 SCSI+ driver"
+    .ascii  "$VER: dataflyer.device 1.0.5 (31.10.2026) DataFlyer 1200 SCSI+ driver"
     .byte   0
     .even
 
