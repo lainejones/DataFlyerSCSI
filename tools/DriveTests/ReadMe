@@ -1,12 +1,20 @@
 DriveTests - stress tests for Amiga disk drivers and file systems
 ==================================================================
 
-Three tools that look at a drive from three levels:
+Four tools that look at a drive from three levels:
 
   flysuite   the DRIVER: it drives a unit of any trackdisk-style device
              driver (CMD_READ, TD64, NSD, HD_SCSICMD) and checks every
              answer. Written for an NCR 53C80 SCSI driver, usable on any
              driver: DEVICE= and a unit.
+  devsoak    the DRIVER again, DESTRUCTIVELY: Simon Dick's soak tester
+             overwrites every sector of a range or a partition you give
+             it, keeps per-sector state, and proves the CONTENT stays
+             right for hours with several tasks and several requests in
+             flight (plus the edge cases: bounds, alignment, zero length,
+             the 64-bit high word, stale change counts). Where flysuite
+             saves and restores, devsoak destroys: give it a partition
+             you do not need. Kickstart 1.3 and up.
   AmiFSX     the FILES: a port of fsx, the file system exerciser from
              NeXT/Apple still used by FreeBSD and xfstests. It keeps a
              model of a test file and hammers the real one with random
@@ -22,8 +30,9 @@ Three tools that look at a drive from three levels:
 
 A driver bug then shows up at the level it lives at: a wrong error code
 or a dropped byte in flysuite, a corrupted file in AmiFSX, a damaged
-structure in AmiDefrag. All three need AmigaOS 2.04 or newer; flysuite
-and AmiFSX run on a 68000.
+structure in AmiDefrag; devsoak catches a driver that silently corrupts
+data under load. All need AmigaOS 2.04 or newer except devsoak (1.3);
+flysuite, AmiFSX and devsoak run on a 68000.
 
 In this drawer
   flysuite        the driver test (flysuite.md: every option and check)
@@ -36,10 +45,17 @@ In this drawer
                   then REBOOTED the machine on exit. RunTests therefore
                   skips it unless you add AMIDEFRAG; run it by hand on a
                   machine with nothing unsaved. Reported upstream.
+  devsoak         the destructive soak tester (devsoak.md: the whole
+                  manual) - version 1.1, by Simon Dick (sidick). It is
+                  NOT run by RunTests: it overwrites the partition or
+                  range you name, with no undo. By hand only.
+  devsoak.quirks  its list of known driver-specific behaviour; devsoak
+                  looks for it beside its own binary, so keep them together
   RAD-FFS         a mountlist for a RAD: FFS volume, a harmless first
                   target for AmiFSX
   LICENSE         GPL-3.0 for flysuite and AmiFSX (github.com/lainejones)
   LICENSE-AmiDefrag  MIT (github.com/ChuckyGang/AmiDefrag)
+  LICENSE-devsoak    BSD 2-Clause (github.com/sidick/devsoak)
 
 
 Running it
@@ -66,8 +82,8 @@ it INQUIRY and TEST UNIT READY while the network driver is using it:
 From a PC: these run on the Amiga, not on the PC. Get the drawer onto the
 Amiga whole (LhA on the Amiga keeps the executable bits; unpacked on a
 PC and copied over, the bits are lost - RunTests puts them back, a Shell
-user does `Protect flysuite +e` and the same for AmiFSX, AmiDefrag and
-volunit). In an emulator (WinUAE, Copperline) with the drawer in a host
+user does `Protect flysuite +e` and the same for AmiFSX, AmiDefrag,
+devsoak and volunit). In an emulator (WinUAE, Copperline) with the drawer in a host
 folder it runs the same way, against the emulated drive - fine for a
 driver that runs in the emulator, no use for one that only exists on
 real hardware.
@@ -89,16 +105,29 @@ take the machine down (a Guru, or a reset with nothing on screen). Then:
     data. The tool only accepts a range outside every partition and
     mounted volume, so that is unused space, not your files.
   - AmiDefrag's analysis and AmiFSX in Quick mode write nothing.
+  - devsoak (by hand only) had overwritten the partition you gave it
+    before anything crashed: that partition is scrap either way.
 A crash in Quick mode is a driver finding in itself: say which test.
 
 
-The three in order, on a scratch volume (by hand)
+The tools in order, on a scratch volume (by hand)
 -------------------------------------------------
   flysuite DEVICE=yourscsi.device UNIT=0 TESTS=all WRITEFILE=Scratch:t
   AmiFSX Scratch:fsxtest N=100000 P=5000 C=100 XREAD
   AmiDefrag Scratch: MAP WIDTH=72
 
-and read the AmiDefrag map for anything "unknown".
+and read the AmiDefrag map for anything "unknown". Then, if the scratch
+partition can go:
+
+  devsoak Scratch: -d -t 30m -y
+
+devsoak takes the partition's own extent as its range (nothing outside
+it is written), inhibits the file system for the run and overwrites
+every sector in it, with several tasks at once, for the time you give
+it (-t 8h for a real soak; -w and -q for more workers and deeper
+queues). A partition with a mounted volume on it must be confirmed by
+typing the volume's name back; -y does not skip that. Reformat the
+partition afterwards. devsoak.md has every option.
 
 
 flysuite - first run, read-only
@@ -178,8 +207,9 @@ Reporting
 flysuite: the LOG=file (every line, flushed as it goes) and the summary;
 SEED= repeats a run. AmiFSX: the operation dump and the seed.
 Issues: github.com/lainejones/DriveTests (the kit, RunTests, volunit),
-github.com/lainejones/DataFlyerSCSI (flysuite) and
-github.com/lainejones/AmiFSX.
+github.com/lainejones/DataFlyerSCSI (flysuite),
+github.com/lainejones/AmiFSX, github.com/sidick/devsoak and
+github.com/ChuckyGang/AmiDefrag.
 
 
 Credits
@@ -195,6 +225,9 @@ Credits
                                 (MIT, LICENSE-AmiDefrag) - thanks for a
                                 block-map analyser that reads FFS, PFS3
                                 and SFS alike
-  luVWagn                       whose CSA Twelve Gauge driver work is the
-                                reason the kit runs on any driver, not
-                                just ours
+  devsoak 1.1                   Simon Dick (sidick), github.com/sidick/
+                                devsoak (BSD 2-Clause, LICENSE-devsoak) -
+                                thanks for offering it to the kit
+  luVWagn                       whose re-engineered csascsi.device for
+                                the CSA Twelve Gauge was the first driver
+                                outside ours the kit was tidied up for

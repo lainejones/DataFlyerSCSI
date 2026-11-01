@@ -992,6 +992,9 @@ static int needs_task(UWORD cmd)
     case NSCMD_TD_READ64: case NSCMD_TD_WRITE64: case NSCMD_TD_FORMAT64: case HD_SCSICMD:
     case TD_GETGEOMETRY: case TD_CHANGESTATE: case TD_EJECT: case TD_MOTOR: case CMD_UPDATE:
     case CMD_RESET: case 0x7ff3:
+    case CMD_FLUSH:         /* nothing to do, but it must not be answered
+                             * ahead of the requests queued before it
+                             * (devsoak's flush-gate caught it as quick) */
         return 1;
     }
     return 0;
@@ -1480,7 +1483,7 @@ struct Device *df_init(REG(d0, BPTR seg))
     dev->dd_Library.lib_Node.ln_Name = (char *)df_devname;
     dev->dd_Library.lib_Flags = LIBF_SUMUSED | LIBF_CHANGED;
     dev->dd_Library.lib_Version = 1;
-    dev->dd_Library.lib_Revision = 5;
+    dev->dd_Library.lib_Revision = 6;
     dev->dd_Library.lib_IdString = (APTR)df_idstring;
     dfdev = dev;
     AddDevice(dev);
