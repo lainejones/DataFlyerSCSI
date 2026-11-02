@@ -6,7 +6,7 @@
  * requests, concurrency, a soak, the BlueSCSI/ZuluSCSI Toolbox, and on an
  * emulator a CDB fuzzer. docs/flysuite.md has every test and the safety rules.
  *
- *   flysuite UNIT=<n> [DEVICE=<name>] [UNIT2=<n>] [TESTS=all|conf,big,edge,conc,soak,toolbox,fuzz]
+ *   flysuite UNIT=<n> [DEVICE=<name>] [UNIT2=<n>] [TESTS=all|conf,big,edge,conc,soak,toolbox,fuzz,latency,dma16]
  *            [MINUTES=<n>] [SECONDS=<n>] [WRITEFILE=<vol:dir>] [RAWWRITE=<first>,<count>]
  *            [FUZZ] [FUZZN=<n>] [IKNOW] [TOOLBOX] [WORKERS=<n>] [TIMEOUT=<s>] [SEED=<n>]
  *            [LOG=<file>] [QUIET]
@@ -48,7 +48,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 
-static const char version[] = "$VER: flysuite 1.0 (31.10.2026)";
+static const char version[] = "$VER: flysuite 1.1 (1.11.2026)";
 
 struct Device *TimerBase;
 
@@ -1791,6 +1791,215 @@ static void t_conc(void)
     }
 }
 
+/* ---- latency: does the rest of the system keep running? ---------------- */
+
+/* A child at priority 21 (above input.device) asks timer.device for 10 ms sleeps,
+ * over and over, and notes how late each one comes back. Nothing below priority
+ * 21 can delay it; a driver that holds Forbid() or Disable() through a transfer,
+ * or busy-polls in a task above 21, can - and that is what a user sees as a
+ * frozen pointer and a stalled network. j->idx: 0 = the idle phase, 1 = under
+ * load, 2 = stop. Results per phase: samples, worst lateness (us), samples over 20 ms. */
+static void j_sampler(struct Job *j)
+{
+    struct MsgPort *mp = CreateMsgPort();
+    struct timerequest *tr = mp ? (struct timerequest *)CreateIORequest(mp, sizeof(struct timerequest)) : NULL;
+    if (!tr || OpenDevice((STRPTR)TIMERNAME, UNIT_MICROHZ, (struct IORequest *)tr, 0)) { j->err = 1; goto out; }
+    while (j->idx < 2) {
+        struct timeval a, b;
+        LONG dt, late;
+        int ph = j->idx;
+        GetSysTime(&a);
+        tr->tr_node.io_Command = TR_ADDREQUEST;
+        tr->tr_time.tv_secs = 0;
+        tr->tr_time.tv_micro = 10000;
+        DoIO((struct IORequest *)tr);
+        GetSysTime(&b);
+        dt = (LONG)(b.tv_secs - a.tv_secs) * 1000000L + ((LONG)b.tv_micro - (LONG)a.tv_micro);
+        late = dt > 10000 ? dt - 10000 : 0;
+        if (ph == 0) { j->n1++; if ((ULONG)late > j->n2) j->n2 = late; if (late > 20000) j->n3++; }
+        else         { j->n4++; if ((ULONG)late > j->maxms) j->maxms = late; if (late > 20000) j->ms++; }
+        j->beat = now_ms();
+    }
+    CloseDevice((struct IORequest *)tr);
+out:
+    if (tr) DeleteIORequest((struct IORequest *)tr);
+    if (mp) DeleteMsgPort(mp);
+}
+
+static void t_latency(void)
+{
+    struct Job *j;
+    UBYTE *b = NULL;
+    ULONG n, lba = 0, reads = 0, kb = 0, t0, ms, idle, load, top;
+    int scsi_ok = 1, path, ok;
+    LONG e = 0;
+    grp = "sys";
+    if (!U.blocks) { res(R_SKIP, grp, "LATENCY: no medium"); return; }
+    n = umin(128, U.blocks);
+    if ((n << U.sh) > 65536) n = 65536 >> U.sh;
+    if (!n) n = 1;
+    if (!(b = gbuf(n << U.sh, MEMF_ANY)) || !(j = job_new())) { res(R_SKIP, grp, "LATENCY: no memory"); gfree(b); return; }
+    g_jobpri = 21;
+    ok = job_start(j, j_sampler);
+    g_jobpri = 0;
+    if (!ok) { res(R_SKIP, grp, "LATENCY: can't start the sampler"); gfree(b); return; }
+    t0 = now_ms();
+    while (now_ms() - t0 < 3000 && !g_break) tick(250);      /* idle: what this machine does anyway */
+    drain();
+    if (j->err) { res(R_SKIP, grp, "LATENCY: the sampler can't open timer.device"); gfree(b); return; }
+    /* CMD_READ reaches the first 4 GB only */
+    top = U.blocks;
+    if (U.sh && top > (0xffffffffUL >> U.sh)) top = 0xffffffffUL >> U.sh;
+    j->idx = 1;
+    t0 = now_ms();
+    while (now_ms() - t0 < 6000 && !g_stuck && !g_break) {   /* load: reads through the driver, back to back */
+        path = (scsi_ok && (reads & 1)) ? P_SCSI : P_CMD;      /* CMD_READ and HD_SCSICMD READ(10) in turn */
+        e = rd(M, path, lba, n, b);
+        if (HUNG()) break;
+        if (e && path == P_SCSI) { scsi_ok = 0; e = 0; continue; }   /* no READ(10) through HD_SCSICMD: CMD_READ only */
+        if (e) break;
+        reads++; kb += (n << U.sh) >> 10;
+        lba += n;
+        if (lba + n > top) lba = 0;
+    }
+    ms = now_ms() - t0;
+    j->idx = 2;
+    if (!wait_jobs(&j, 1, g_tmo + 5000)) { gfree(b); return; }
+    idle = j->n2; load = j->maxms;
+    if (e && !reads) { res(R_FAIL, grp, "LATENCY: the load reads failed at once: io_Error %ld", (long)e); gfree(b); return; }
+    res(load > idle + 50000 ? R_FAIL : R_PASS, grp,
+        "LATENCY: a priority-21 task's 10 ms sleeps: idle worst %lu ms (%lu samples), during %lu reads of %lu KB (%lu KB/s) worst %lu ms, %lu of %lu over 20 ms",
+        (unsigned long)(idle / 1000), (unsigned long)j->n1, (unsigned long)reads, (unsigned long)((n << U.sh) >> 10),
+        (unsigned long)(ms ? kb * 1000 / ms : 0), (unsigned long)(load / 1000), (unsigned long)j->ms, (unsigned long)j->n4);
+    if (load > idle + 50000)
+        say("    the driver kept the CPU from a priority-21 task for up to %lu ms: Forbid()/Disable() around a transfer, or a busy loop in a task above 21",
+            (unsigned long)(load / 1000));
+    else if (idle > 50000)
+        say("    already %lu ms late with no disk traffic: something else on this machine holds the CPU, so this says little about the driver",
+            (unsigned long)(idle / 1000));
+    gfree(b);
+}
+
+/* ---- dma16: buffers above the 16 MB line -------------------------------- */
+
+/* A Zorro II DMA controller (A2091, GVP Series II, ...) reaches only the first
+ * 16 MB of the address space; its driver must copy through a buffer it can reach
+ * when the caller's buffer is higher (accelerator RAM on an A2000/A3000/A4000).
+ * The buffer here comes from a memory header above $01000000 (exec Allocate()),
+ * and every read is compared with the same blocks read into chip RAM. */
+static struct MemHeader *hi_mh;
+static UBYTE *hi_alloc(ULONG len)
+{
+    struct MemHeader *mh;
+    UBYTE *p = NULL;
+    Forbid();
+    for (mh = (struct MemHeader *)SysBase->MemList.lh_Head; mh->mh_Node.ln_Succ; mh = (struct MemHeader *)mh->mh_Node.ln_Succ)
+        if ((ULONG)mh->mh_Lower >= 0x01000000UL && (p = Allocate(mh, len)) != NULL) { hi_mh = mh; break; }
+    Permit();
+    return p;
+}
+
+static void hi_free(UBYTE *p, ULONG len)
+{
+    if (!p || !hi_mh || g_stuck) return;
+    Forbid();
+    Deallocate(hi_mh, p, len);
+    Permit();
+}
+
+static void t_dma16(void)
+{
+    static const int offs[2] = { 0, 2 };
+    UBYTE *hi = NULL, *ref = NULL, *ref2 = NULL, *save = NULL;
+    ULONG nmax, len, lba, sizes[3], hilen;
+    int p, s, o, k;
+    LONG e;
+    grp = "dma16";
+    if (!U.blocks) { res(R_SKIP, grp, "no medium"); return; }
+    nmax = umin(128, U.blocks);
+    if ((nmax << U.sh) > 65536) nmax = 65536 >> U.sh;
+    if (!nmax) nmax = 1;
+    len = nmax << U.sh;
+    hilen = len + 8 + GUARD;
+    if (!(hi = hi_alloc(hilen))) {
+        res(R_SKIP, grp, "no free RAM above 16 MB on this machine (chip, Zorro II or 24-bit RAM only): nothing to test");
+        return;
+    }
+    ref = gbuf(len, MEMF_CHIP); ref2 = gbuf(len, MEMF_CHIP);
+    if (!ref) ref = gbuf(len, MEMF_ANY);
+    if (!ref2) ref2 = gbuf(len, MEMF_ANY);
+    if (!ref || !ref2) { res(R_SKIP, grp, "no memory for the reference buffers"); goto out; }
+    say("    buffer at $%08lx (in \"%s\", $%08lx-$%08lx); reference in %s RAM", (unsigned long)hi,
+        hi_mh->mh_Node.ln_Name ? hi_mh->mh_Node.ln_Name : "?", (unsigned long)hi_mh->mh_Lower, (unsigned long)hi_mh->mh_Upper,
+        (TypeOfMem(ref) & MEMF_CHIP) ? "chip" : "other");
+    /* a third of the way in: away from block 0 and from an FFS root block in the middle */
+    lba = U.blocks / 3;
+    if (lba + nmax > U.blocks) lba = 0;
+    sizes[0] = 1; sizes[1] = umin(16, nmax); sizes[2] = nmax;
+    for (p = 0; p < 4 && !g_stuck && !g_break; p++) {
+        if (p == P_CMD && (((unsigned long long)(lba + nmax) << U.sh) >> 32)) continue;
+        e = rd(M, p, lba, 1, ref);
+        if (HUNG()) goto out;
+        if (e) { res(R_SKIP, grp, "%s: not available here (io_Error %ld)", pname[p], (long)e); continue; }
+        for (s = 0; s < 3; s++)
+            for (o = 0; o < 2; o++) {
+                ULONG n = sizes[s], bl = n << U.sh;
+                UBYTE *b = hi + offs[o];
+                int tries;
+                if (s == 1 && sizes[1] == sizes[0]) continue;
+                if (s == 2 && sizes[2] == sizes[1]) continue;
+                for (tries = 0; tries < 2; tries++) {
+                    int same;
+                    e = rd(M, p, lba, n, ref);
+                    if (HUNG()) goto out;
+                    memset(b, 0xee, bl); guard_set(b, bl);
+                    e = e ? e : rd(M, p, lba, n, b);
+                    if (HUNG()) goto out;
+                    same = !e && !memcmp(b, ref, bl) && guard_ok(b, bl);
+                    if (same || e) {
+                        CK(same, "%s %lu block%s into RAM above 16 MB ($%08lx, %s): %s", pname[p], (unsigned long)n, n == 1 ? "" : "s",
+                           (unsigned long)b, o ? "2 bytes off" : "aligned",
+                           e ? "error" : same ? "same as in chip RAM" : !guard_ok(b, bl) ? "OVERRUN past the buffer" : "DIFFERENT");
+                        break;
+                    }
+                    /* different: did the blocks themselves change (a file system writing there)? */
+                    if (rd(M, p, lba, n, ref2) == 0 && memcmp(ref, ref2, bl)) { if (!tries) continue; }
+                    for (k = 0; k < (int)bl && b[k] == ref[k]; k++) ;
+                    CK(0, "%s %lu block%s into RAM above 16 MB ($%08lx, %s): DIFFERENT from byte %ld (got $%02x, chip RAM has $%02x)",
+                       pname[p], (unsigned long)n, n == 1 ? "" : "s", (unsigned long)b, o ? "2 bytes off" : "aligned",
+                       (long)k, k < (int)bl ? b[k] : 0, k < (int)bl ? ref[k] : 0);
+                    break;
+                }
+            }
+    }
+    /* writes from that RAM: only inside RAWWRITE, saved first and put back */
+    if (!g_rwcount) { res(R_SKIP, grp, "writes from RAM above 16 MB: need RAWWRITE (the blocks are saved, used and restored)"); goto out; }
+    {
+        ULONG n = umin(16, umin(g_rwcount, nmax)), bl = n << U.sh, i;
+        int wp = (((unsigned long long)(g_rwfirst + n) << U.sh) >> 32) ? P_TD64 : P_CMD;   /* CMD_WRITE below 4 GB */
+        if (!(save = gbuf(bl, MEMF_ANY))) { res(R_SKIP, grp, "writes: no memory to save the range"); goto out; }
+        if (rd(M, wp, g_rwfirst, n, save)) { res(R_FAIL, grp, "writes: can't read blocks %lu-%lu to save them", (unsigned long)g_rwfirst, (unsigned long)(g_rwfirst + n - 1)); goto out; }
+        for (o = 0; o < 2 && !g_stuck; o++) {
+            UBYTE *b = hi + offs[o];
+            for (i = 0; i < bl; i++) b[i] = (UBYTE)(i * 7 + 3 + o * 101);
+            e = wr(M, wp, g_rwfirst, n, b);
+            if (HUNG()) break;
+            memset(ref, 0, bl);
+            if (!e) e = rd(M, wp, g_rwfirst, n, ref);
+            CK(!e && !memcmp(ref, b, bl), "%s of %lu blocks from RAM above 16 MB ($%08lx, %s), read back into chip RAM: %s", wname[wp],
+               (unsigned long)n, (unsigned long)b, o ? "2 bytes off" : "aligned", e ? "error" : !memcmp(ref, b, bl) ? "same" : "DIFFERENT");
+        }
+        if (!g_stuck) {
+            e = wr(M, wp, g_rwfirst, n, save);
+            if (!e) e = rd(M, wp, g_rwfirst, n, ref);
+            CK(!e && !memcmp(ref, save, bl), "writes: blocks %lu-%lu written back as they were", (unsigned long)g_rwfirst, (unsigned long)(g_rwfirst + n - 1));
+        }
+    }
+out:
+    hi_free(hi, hilen);
+    gfree(ref); gfree(ref2); gfree(save);
+}
+
 /* ---- group 5: soak ------------------------------------------------------ */
 
 static ULONG file_verify(struct Job *j, struct Ctx *c, const char *path, ULONG size, ULONG seed, UBYTE *buf, UBYTE *gen,
@@ -3141,13 +3350,16 @@ static int parse_range(const char *p, ULONG *first, ULONG *count)
 #define G_ATAPIDIR 8192
 #define G_RUNEND 16384
 #define G_MIX 32768
-#define G_ALL (0x7f | G_ERRMAP | G_CDBPASS)
+#define G_LATENCY 65536
+#define G_DMA16 131072
+#define G_ALL (0x7f | G_ERRMAP | G_CDBPASS | G_LATENCY | G_DMA16)
 #define G_AUDIT (G_ERRMAP | G_CDBPASS | G_DIRMIS | G_CDLATE | G_RACE)
 
 static int parse_tests(const char *s)
 {
-    static const char *const nm[16] = { "conf", "big", "edge", "conc", "soak", "toolbox", "fuzz", "errmap", "cdbpass",
-                                        "dirmis", "slowcmd", "cdlate", "raceopen", "atapidir", "runend", "mix" };
+    static const char *const nm[18] = { "conf", "big", "edge", "conc", "soak", "toolbox", "fuzz", "errmap", "cdbpass",
+                                        "dirmis", "slowcmd", "cdlate", "raceopen", "atapidir", "runend", "mix",
+                                        "latency", "dma16" };
     int m = 0;
     while (*s) {
         char w[16];
@@ -3158,8 +3370,8 @@ static int parse_tests(const char *s)
         if (!n) break;
         if (!strcmp(w, "all")) { m |= G_ALL; continue; }
         if (!strcmp(w, "audit")) { m |= G_AUDIT; continue; }
-        for (i = 0; i < 16; i++) if (!strcmp(w, nm[i])) break;
-        if (i == 16) return -1;
+        for (i = 0; i < 18; i++) if (!strcmp(w, nm[i])) break;
+        if (i == 18) return -1;
         m |= 1 << i;
     }
     return m;
@@ -3191,7 +3403,7 @@ int main(void)
                    "IKNOW/S,TOOLBOX/S,WORKERS/K/N,TIMEOUT/K/N,SEED/K/N,LOG/K,QUIET/S,DANGER/S,SKIPIDS/K,RAWWRITE2/K,RAWIDE/K,IDE/K/N,FILES/K", args, NULL);
     if (!rda) {
         con("flysuite UNIT=<n> [DEVICE=<name>, default dataflyer.device] [UNIT2=<n>] [TESTS=all|audit|conf,big,edge,conc,soak,toolbox,fuzz,\n"
-               "         errmap,cdbpass,dirmis,slowcmd,cdlate,raceopen,atapidir,runend] [MINUTES=<n>] [SECONDS=<n>]\n"
+               "         errmap,cdbpass,dirmis,slowcmd,cdlate,raceopen,atapidir,runend,latency,dma16] [MINUTES=<n>] [SECONDS=<n>]\n"
                "         [WRITEFILE=<vol:dir>] [RAWWRITE=<first>,<count>] [FUZZ] [FUZZN=<n>] [IKNOW] [DANGER]\n"
                "         [TOOLBOX] [WORKERS=<n>] [TIMEOUT=<s>] [SEED=<n>] [LOG=<file>] [QUIET] [SKIPIDS=<id,id>]\n"
                "         mix: [RAWWRITE2=<first>,<count>] [FILES=<dir>,<dir>,...]\n"
@@ -3232,7 +3444,7 @@ int main(void)
         FreeArgs(rda);
         return 20;
     }
-    if (args[3] && (tests = parse_tests((const char *)args[3])) < 0) { con("flysuite: TESTS: conf,big,edge,conc,soak,toolbox,fuzz or all\n"); FreeArgs(rda); return 20; }
+    if (args[3] && (tests = parse_tests((const char *)args[3])) < 0) { con("flysuite: TESTS: conf,big,edge,conc,soak,toolbox,fuzz,latency,dma16, an audit test or all\n"); FreeArgs(rda); return 20; }
     if (args[4]) g_minutes = *(LONG *)args[4];
     if (args[5]) g_secs = *(LONG *)args[5];
     g_wfile = (const char *)args[6];
@@ -3304,18 +3516,19 @@ int main(void)
         }
         gfree(b);
     }
-    con("flysuite 1.0: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
+    con("flysuite 1.1: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
            U.vendor, U.product, U.rev, U.devtype, (unsigned long)U.blocks, (unsigned long)U.bs,
            (unsigned long)(((unsigned long long)U.blocks * U.bs) >> 20), U.pattern ? ", pattern disk" : "",
            U.emu ? ", emulator" : "", U.toolbox ? ", Toolbox" : "");
-    con("  tests:%s%s%s%s%s%s%s%s%s  seed %lu  timeout %lu s  opened in %lu ms\n", tests & G_CONF ? " conf" : "", tests & G_BIG ? " big" : "",
+    con("  tests:%s%s%s%s%s%s%s%s%s%s%s  seed %lu  timeout %lu s  opened in %lu ms\n", tests & G_CONF ? " conf" : "", tests & G_BIG ? " big" : "",
            tests & G_EDGE ? " edge" : "", tests & G_TOOLBOX ? " toolbox" : "", tests & G_CONC ? " conc" : "",
            tests & G_SOAK ? " soak" : "", tests & G_FUZZ ? " fuzz" : "", tests & G_MIX ? " mix" : "",
- tests & ~(0x7f | G_MIX) ? " audit" : "", (unsigned long)g_seed,
+           tests & G_LATENCY ? " latency" : "", tests & G_DMA16 ? " dma16" : "",
+           tests & ~(0x7f | G_MIX | G_LATENCY | G_DMA16) ? " audit" : "", (unsigned long)g_seed,
            (unsigned long)(g_tmo / 1000), (unsigned long)ms);
     if (g_log) {
         char b[200];
-        sprintf(b, "flysuite 1.0: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
+        sprintf(b, "flysuite 1.1: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
                 (unsigned long)U.blocks, (unsigned long)U.bs, (unsigned long)g_seed);
         out_line(0, b);
     }
@@ -3374,6 +3587,8 @@ int main(void)
     if ((tests & G_BIG) && !g_stuck && !g_break) t_big();
     if ((tests & G_EDGE) && !g_stuck && !g_break) t_edge();
     if ((tests & G_TOOLBOX) && !g_stuck && !g_break) t_toolbox();
+    if ((tests & G_DMA16) && !g_stuck && !g_break) t_dma16();
+    if ((tests & G_LATENCY) && !g_stuck && !g_break) t_latency();
     if ((tests & G_CONC) && !g_stuck && !g_break) t_conc();
     if ((tests & G_SOAK) && !g_stuck && !g_break) t_soak();
     if ((tests & G_ERRMAP) && !g_stuck && !g_break) t_errmap();

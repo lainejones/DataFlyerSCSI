@@ -63,7 +63,8 @@ $(OUT)/volunit: tools/volunit.c
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -s -o $@ $<
 
-# 68020: flysuite runs where the driver runs (A1200)
+# 68000 like the rest: DriveTests ships flysuite for any driver, and its dma16
+# test is aimed at Zorro II DMA cards, which often sit in 68000 machines
 $(OUT)/flysuite: tools/flysuite.c
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -m68020 -s -o $@ $<
+	$(CC) $(CFLAGS) -s -o $@ $<

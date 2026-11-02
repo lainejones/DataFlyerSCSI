@@ -63,7 +63,8 @@ Running it
 From Workbench: double-click RunTests. It asks for a SCRATCH drawer on
 the drive to test (a file requester), works out the drive's device driver
 and unit from it, then asks Quick or Full:
-  Quick  reads only, writes nothing: flysuite's conf/big/edge/audit
+  Quick  reads only, writes nothing: flysuite's conf/big/edge/dma16/
+         latency/audit
   Full   also writes test files in that drawer (made, checked and deleted
          again) and runs AmiFSX there
 (the AmiDefrag analysis only with AMIDEFRAG on the Shell line - see above)
@@ -125,9 +126,11 @@ devsoak takes the partition's own extent as its range (nothing outside
 it is written), inhibits the file system for the run and overwrites
 every sector in it, with several tasks at once, for the time you give
 it (-t 8h for a real soak; -w and -q for more workers and deeper
-queues). A partition with a mounted volume on it must be confirmed by
-typing the volume's name back; -y does not skip that. Reformat the
-partition afterwards. devsoak.md has every option.
+queues - give those a longer watchdog, -W 60 for -w 4 -q 4 on a slow
+drive). A WATCHDOG FAIL ends devsoak but leaves its worker tasks
+running: reboot straight after one. A partition with a mounted volume
+on it must be confirmed by typing the volume's name back; -y does not
+skip that. Reformat the partition afterwards. devsoak.md has every option.
 
 
 flysuite - first run, read-only
@@ -150,8 +153,11 @@ Writing needs an explicit option:
 
 The groups (TESTS=): conf (HD_SCSICMD conformance), big (1-2048 block
 reads through every path, across 2/4 GB), edge (end of unit, odd
-lengths, the trackdisk queries, open/close), conc (several tasks at
-once + AbortIO), soak (MINUTES= of write/read/compare), mix (every
+lengths, the trackdisk queries, open/close), dma16 (reads into RAM
+above 16 MB, which a Zorro II DMA controller can't reach: the driver
+must copy), latency (does a priority-21 task keep running while the
+driver reads - catches Forbid/Disable around transfers), conc (several
+tasks at once + AbortIO), soak (MINUTES= of write/read/compare), mix (every
 SCSI/IDE read+write combination at once, for two-port drivers), audit
 (one test per finding of a 53C80 driver audit: error codes, data
 direction mismatches, byte-1 rewriting, first-open race, ATAPI

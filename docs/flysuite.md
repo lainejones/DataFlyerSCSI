@@ -19,7 +19,7 @@ another driver"). The header says which mode a run is in (`mode: ...`).
 
 | Option | Meaning |
 |---|---|
-| `TESTS=` | Comma list: `conf,big,edge,conc,soak,toolbox,fuzz,mix` and the audit tests (below). `all` = conf, big, edge, toolbox, conc, soak, errmap, cdbpass (+ fuzz with `FUZZ`). `audit` = errmap, cdbpass, dirmis, cdlate, raceopen. Default `all`. |
+| `TESTS=` | Comma list: `conf,big,edge,conc,soak,toolbox,fuzz,mix,latency,dma16` and the audit tests (below). `all` = conf, big, edge, toolbox, dma16, latency, conc, soak, errmap, cdbpass (+ fuzz with `FUZZ`). `audit` = errmap, cdbpass, dirmis, cdlate, raceopen. Default `all`. |
 | `MINUTES=` | Soak length (1). |
 | `SECONDS=` | conc length, length of each mix phase, CDLATE's wait (20). |
 | `WORKERS=` | conc reader tasks (4, max 9). |
@@ -116,6 +116,33 @@ unknown opcode with ASC $24, not $20; both pass. A command the target does not h
 - COUNT ($D2), and LIST ($D0): 40-byte entries, numbered in order.
 - The vendor-CDB byte-1 check: GET from index 32 on.
 - GET ($D1) of files 0, 1, 31, 33 and the last one, each twice: same bytes, size as listed.
+
+**dma16** (read-only; writes only inside `RAWWRITE`): buffers above the 16 MB line.
+- A Zorro II DMA controller (A2091, GVP Series II, ...) reaches only the first 16 MB; its driver
+  has to copy through a buffer it can reach when the caller's buffer is higher - accelerator RAM
+  on an A2000/A3000/A4000, or a TF/Blizzard board in an A1200.
+- The buffer comes from a memory header that starts at or above `$01000000` (exec `Allocate()`).
+  No such RAM: SKIP, and the line says why.
+- 1, 16 and 128 blocks (at most 64 KB), at an even address and 2 bytes off, through CMD_READ,
+  TD_READ64, NSCMD_TD_READ64 and SCSI READ(10), each compared with the same blocks read into chip
+  RAM just before. Guard bytes after the buffer. A path the driver lacks is a SKIP.
+- The blocks are a third of the way into the unit, away from block 0 and from an FFS root block.
+  When a compare fails, the blocks are read again: if they changed (a file system writing there)
+  the check is repeated once.
+- With `RAWWRITE`: 16 blocks written from that RAM (even and 2 bytes off), read back into chip
+  RAM, compared, then the saved blocks are written back and checked.
+
+**latency** (read-only): does the rest of the system keep running while the driver works?
+- A child process at priority 21 (above input.device) asks timer.device for 10 ms sleeps over and
+  over and notes how late each comes back: 3 s idle, then 6 s while the main task reads 64 KB at a
+  time through CMD_READ and SCSI READ(10) in turn.
+- Nothing below priority 21 can make it late. A driver that holds `Forbid()` or `Disable()` through
+  a transfer, or busy-polls in a task above 21, can - the user sees a pointer that freezes and a
+  network that stalls during disk access.
+- FAIL when the worst lateness under load is more than 50 ms above the idle worst. The line gives
+  both, the read speed, and how many sleeps were over 20 ms. If the idle worst is already over
+  50 ms, a note says that something else on the machine holds the CPU and the result says little.
+- Checked against a program that holds `Forbid()` for 100 ms at a time: the sampler saw 95-99 ms.
 
 **conc**: `WORKERS` reader processes, each with its own IORequest, on UNIT. With UNIT2, every
 other reader is on UNIT2. Plus one AbortIO worker, and one reader on the IDE unit if it opens.
