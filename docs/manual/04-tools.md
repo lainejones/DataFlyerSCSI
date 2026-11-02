@@ -16,6 +16,15 @@ system does for a boot drive. `ALL` looks at SCSI ids 0 to 6 and the IDE units
 flagged "no automount" unless `FORCE` is given. `DEVICE` defaults to
 `dataflyer.device`, so the tool works for other drivers too.
 
+Each partition gets the file system its type names (from 1.1). If the drive's
+RDB carries that file system (PFS3, SFS and so on, put there by HDToolBox) and
+it is newer than the one already loaded, or none is loaded, RDBMount loads it
+from the RDB, as the system does for a boot drive, and every partition of that
+type uses it. FFS partitions use the ROM's FFS as before. A partition of
+another type whose file system is nowhere to be found is not mounted, with a
+message saying so: before 1.1 it was mounted with FFS, which then saw "not a
+DOS disk".
+
 ## flytest
 
 ```

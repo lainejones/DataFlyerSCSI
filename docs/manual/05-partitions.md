@@ -15,6 +15,18 @@ built-in IDE port (units 100 and 101). HDToolBox also works through
 
 The board's own `DF-Prep` is not needed.
 
+## Drives over 4 GB, and other file systems
+
+Drives and partitions over 4 GB work: the driver has TD64 and NSD, and the
+system's FFS (OS 3.2) and PFS3 use them by themselves. Tested with an 8 GB
+drive: one FFS partition below 4 GB, one across the 4 GB line and a PFS3
+partition entirely above it, each written and checked with AmiFSX.
+
+A partition can have any file system HDToolBox can put in the drive's RDB
+(PFS3, SFS and so on). `RDBMount` loads it from there when it isn't loaded
+already, or when the RDB's copy is newer, just as the system does for a boot
+drive.
+
 ## Speed
 
 Measured on an A1200 with a TF1232 (68030 at 50 MHz), a ZuluSCSI as the SCSI
