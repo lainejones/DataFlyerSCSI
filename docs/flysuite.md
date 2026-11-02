@@ -99,7 +99,8 @@ unknown opcode with ASC $24, not $20; both pass. A command the target does not h
 - CMD_READ and CMD_WRITE carry a 32-bit byte offset, so they only reach the first 4 GB. A test
   never sends one that would start or end beyond that: there TD_READ64 does the reading, and a
   past-the-end check CMD_READ can't make is a SKIP (since 1.1.1; 1.1 failed `edge` on a disk over
-  4 GB).
+  4 GB). Where conc, soak and mix pick a read path at random, a CMD_READ that can't reach the
+  blocks becomes a TD_READ64 (since 1.1.2).
 
 **edge** (read-only):
 - Reads that end exactly at the end of the unit.

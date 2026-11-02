@@ -48,7 +48,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 
-static const char version[] = "$VER: flysuite 1.1.1 (2.11.2026)";
+static const char version[] = "$VER: flysuite 1.1.2 (2.11.2026)";
 
 struct Device *TimerBase;
 
@@ -633,6 +633,12 @@ static LONG wr(struct Ctx *c, int path, ULONG lba, ULONG n, UBYTE *buf)
 static int low_path(struct Ctx *c, ULONG lba, ULONG n)
 {
     return ((unsigned long long)lba + n) << c->sh > 0x100000000ULL ? P_TD64 : P_CMD;
+}
+
+/* a path picked at random, made one that reaches lba..lba+n-1 */
+static int reach(struct Ctx *c, int p, ULONG lba, ULONG n)
+{
+    return p == P_CMD ? low_path(c, lba, n) : p;
 }
 
 static void errtxt(char *b, LONG e)
@@ -1717,7 +1723,7 @@ static void j_worker(struct Job *j)
     end = now_ms() + j->n5 * 1000;
     while (!g_break && !g_stuck && !c->stuck && now_ms() < end) {
         ULONG n = 1 + rnd(&s) % maxn, lba = rnd(&s) % (blocks - n + 1);
-        int p = rnd(&s) % 4;
+        int p = reach(c, rnd(&s) % 4, lba, n);
         LONG e;
         beat(j, "%s: %s %lu blocks at %lu, unit %ld", tag, pname[p], (unsigned long)n, (unsigned long)lba, (long)j->unit);
         if (j->kind == 1) {
@@ -1743,7 +1749,7 @@ static void j_worker(struct Job *j)
             if (!pattern_ok(a, lba, n) && !j->err++)
                 res(R_FAIL, "conc", "%s: %lu blocks at %lu (%s) do not hold the pattern", tag, (unsigned long)n, (unsigned long)lba, pname[p]);
         } else {
-            int q = (p + 1 + rnd(&s) % 3) % 4;
+            int q = reach(c, (p + 1 + rnd(&s) % 3) % 4, lba, n);
             e = rd(c, q, lba, n, b);
             if (e == E_HANG) break;
             if (!e && memcmp(a, b, n * bs) && !j->err++)
@@ -2120,7 +2126,7 @@ static void j_soak(struct Job *j)
         iter++;
         if (g_rwcount) {                                       /* one raw write + read back */
             ULONG n = 1 + rnd(&s) % umin(256, g_rwcount), lba = g_rwfirst + rnd(&s) % (g_rwcount - n + 1), st = s ^ iter;
-            int wp = iter % 4, rp = (iter / 4) % 4;
+            int wp = iter % 4, rp = reach(c, (iter / 4) % 4, lba, n);
             LONG e;
             genfill(a, n * bs, &st);
             beat(j, "soak: %s %lu blocks at %lu", wname[wp], (unsigned long)n, (unsigned long)lba);
@@ -2188,6 +2194,8 @@ static void j_soak(struct Job *j)
             ULONG n = 1 + rnd(&s) % umin(256, blocks), lba = rnd(&s) % (blocks - n + 1);
             int p = rnd(&s) % 4, q = (p + 1 + rnd(&s) % 3) % 4;
             LONG e;
+            p = reach(c, p, lba, n);
+            q = reach(c, q, lba, n);
             beat(j, "soak: %s %lu blocks at %lu", pname[p], (unsigned long)n, (unsigned long)lba);
             e = rd(c, p, lba, n, a);
             if (e == E_HANG) break;
@@ -2484,6 +2492,7 @@ static void j_mix(struct Job *j)
                 continue;
             }
             memcpy(mu->shadow + (lba - mu->first) * bs, a, n * bs);
+            q = reach(c, q, lba, n);
             beat(j, "%s: %s %lu blocks at %lu (read back)", tag, pname[q], (unsigned long)n, (unsigned long)lba);
             e = rd(c, q, lba, n, b);
             if (e == E_HANG) break;
@@ -2496,6 +2505,8 @@ static void j_mix(struct Job *j)
         } else {                                               /* a read anywhere, twice, checked */
             ULONG n = 1 + rnd(&s) % maxn, lba = rnd(&s) % (mu->blocks - n + 1);
             int okb = 1;
+            p = reach(c, p, lba, n);
+            q = reach(c, q, lba, n);
             beat(j, "%s: %s %lu blocks at %lu", tag, pname[p], (unsigned long)n, (unsigned long)lba);
             e = rd(c, p, lba, n, a);
             if (e == E_HANG) break;
@@ -3528,7 +3539,7 @@ int main(void)
         }
         gfree(b);
     }
-    con("flysuite 1.1.1: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
+    con("flysuite 1.1.2: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
            U.vendor, U.product, U.rev, U.devtype, (unsigned long)U.blocks, (unsigned long)U.bs,
            (unsigned long)(((unsigned long long)U.blocks * U.bs) >> 20), U.pattern ? ", pattern disk" : "",
            U.emu ? ", emulator" : "", U.toolbox ? ", Toolbox" : "");
@@ -3540,7 +3551,7 @@ int main(void)
            (unsigned long)(g_tmo / 1000), (unsigned long)ms);
     if (g_log) {
         char b[200];
-        sprintf(b, "flysuite 1.1.1: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
+        sprintf(b, "flysuite 1.1.2: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
                 (unsigned long)U.blocks, (unsigned long)U.bs, (unsigned long)g_seed);
         out_line(0, b);
     }
