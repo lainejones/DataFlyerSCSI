@@ -48,7 +48,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 
-static const char version[] = "$VER: flysuite 1.1 (1.11.2026)";
+static const char version[] = "$VER: flysuite 1.1.1 (2.11.2026)";
 
 struct Device *TimerBase;
 
@@ -591,7 +591,9 @@ static LONG rd(struct Ctx *c, int path, ULONG lba, ULONG n, UBYTE *buf)
         if (!e && (ST(c) || ACT(c) != len)) e = E_SHORT;
         return e;
     }
-    if (path == P_CMD && hi) return E_RANGE;
+    /* CMD_READ has a 32-bit byte offset: it can't start, or end, past 4 GB
+     * (an 8 GB disk's upper half is TD64/NSD/SCSI only) - not even sent */
+    if (path == P_CMD && (hi || (unsigned long long)lo + len > 0x100000000ULL)) return E_RANGE;
     e = bio(c, path == P_CMD ? CMD_READ : path == P_TD64 ? TD_READ64 : NSCMD_TD_READ64, buf, len, lo, hi);
     if (!e && c->io->io_Actual != len) e = E_SHORT;
     return e;
@@ -616,7 +618,7 @@ static LONG wr_r(struct Ctx *c, int path, ULONG lba, ULONG n, UBYTE *buf, ULONG 
         if (!e && (ST(c) || ACT(c) != len)) e = E_SHORT;
         return e;
     }
-    if (path == P_CMD && hi) path = P_TD64;
+    if (path == P_CMD && (hi || (unsigned long long)lo + len > 0x100000000ULL)) path = P_TD64;   /* see rd() */
     e = bio(c, path == P_CMD ? CMD_WRITE : path == P_TD64 ? TD_WRITE64 : NSCMD_TD_WRITE64, buf, len, lo, hi);
     if (!e && c->io->io_Actual != len) e = E_SHORT;
     return e;
@@ -625,6 +627,12 @@ static LONG wr_r(struct Ctx *c, int path, ULONG lba, ULONG n, UBYTE *buf, ULONG 
 static LONG wr(struct Ctx *c, int path, ULONG lba, ULONG n, UBYTE *buf)
 {
     return wr_r(c, path, lba, n, buf, g_rwfirst, g_rwcount);
+}
+
+/* CMD_READ where it reaches (all of it within the first 4 GB), else TD_READ64 */
+static int low_path(struct Ctx *c, ULONG lba, ULONG n)
+{
+    return ((unsigned long long)lba + n) << c->sh > 0x100000000ULL ? P_TD64 : P_CMD;
 }
 
 static void errtxt(char *b, LONG e)
@@ -1111,8 +1119,8 @@ static void t_conf(void)
     LONG fails0 = n_res[R_FAIL];
     if (attempt) lba = (lba / 4) * 3 + 64 * attempt;   /* away from the root block */
     if (lba + 4 > U.blocks) lba = 0;
-    e = rd(c, P_CMD, lba, k, ref);
-    CK(e == 0, "CMD_READ %d blocks at %lu (the reference): io_Error %ld", k, (unsigned long)lba, (long)e);
+    e = rd(c, low_path(c, lba, k), lba, k, ref);
+    CK(e == 0, "%s %d blocks at %lu (the reference): io_Error %ld", pname[low_path(c, lba, k)], k, (unsigned long)lba, (long)e);
     if (U.pattern) CK(pattern_ok(ref, lba, k), "the reference holds the pattern");
     {
         static const int kinds[4] = { 6, 10, 12, 16 };
@@ -1143,16 +1151,18 @@ static void t_conf(void)
         CK(e == 0 && ACT(c) == bs && !memcmp(p, ref, bs) && guard_ok(p, bs), "READ(10) 1 block into %s RAM at an odd address (+%d)",
            k < 2 ? "chip" : "fast", k & 1 ? 3 : 1);
     }
-    memset(fast + 1, 0, bs); guard_set(fast + 1, bs);
-    e = bio(c, CMD_READ, fast + 1, bs, lba << U.sh, 0);
-    CK(e == 0 && c->io->io_Actual == bs && !memcmp(fast + 1, ref, bs) && guard_ok(fast + 1, bs),
-       "CMD_READ 1 block into an odd buffer: io_Error %ld", (long)e);
-    memset(chip, 0, bs); guard_set(chip, bs);
-    e = bio(c, CMD_READ, chip, bs, lba << U.sh, 0);
-    CK(e == 0 && !memcmp(chip, ref, bs) && guard_ok(chip, bs), "CMD_READ 1 block into chip RAM: io_Error %ld", (long)e);
+    if (low_path(c, lba, 1) == P_CMD) {    /* (only big blocks put lba past 4 GB) */
+        memset(fast + 1, 0, bs); guard_set(fast + 1, bs);
+        e = bio(c, CMD_READ, fast + 1, bs, lba << U.sh, 0);
+        CK(e == 0 && c->io->io_Actual == bs && !memcmp(fast + 1, ref, bs) && guard_ok(fast + 1, bs),
+           "CMD_READ 1 block into an odd buffer: io_Error %ld", (long)e);
+        memset(chip, 0, bs); guard_set(chip, bs);
+        e = bio(c, CMD_READ, chip, bs, lba << U.sh, 0);
+        CK(e == 0 && !memcmp(chip, ref, bs) && guard_ok(chip, bs), "CMD_READ 1 block into chip RAM: io_Error %ld", (long)e);
+    }
     if (n_res[R_FAIL] == fails0 || HUNG()) break;
     /* something failed: did the block change under the test? */
-    if (rd(c, P_CMD, lba, k, b) == 0 && memcmp(b, ref, k * bs)) {
+    if (rd(c, low_path(c, lba, k), lba, k, b) == 0 && memcmp(b, ref, k * bs)) {
         LONG n = n_res[R_FAIL] - fails0;
         Forbid(); n_res[R_FAIL] -= n; Permit();
         say("    block %lu changed between the reference and the compares (a mounted file system writing there: its root block?):"
@@ -1164,7 +1174,7 @@ static void t_conf(void)
     /* a buffer shorter than the data, and one longer */
     if (U.blocks > lba + 1 && 2 * bs <= 4096) {
         static const ULONG shortl[2] = { 612, 512 };
-        e = rd(c, P_CMD, lba, 2, ref);
+        e = rd(c, low_path(c, lba, 2), lba, 2, ref);
         for (i = 0; i < 2; i++) {
             ULONG sl = shortl[i] > bs ? bs + 100 : shortl[i];
             if (i == 1) sl = bs;
@@ -1482,17 +1492,19 @@ static void t_edge(void)
             if (HUNG()) goto out;
             if (e == E_RANGE) continue;
             CK(e != 0 && memcmp(b + bs, blk0, bs), "%s of the last block + 1 past the end fails (%ld), no wrap", pname[p], (long)e);
-            e = rd(c, p, N, 1, b);
-            CK(e != 0, "%s of block %lu (= the block count) fails: %ld", pname[p], (unsigned long)N, (long)e);
-            e = rd(c, p, N + 1000, 1, b);
-            CK(e != 0, "%s 1000 blocks past the end fails: %ld", pname[p], (long)e);
+            /* (CMD_READ refused here, unsent: those are past 4 GB, not a driver answer) */
+            if ((e = rd(c, p, N, 1, b)) != E_RANGE)
+                CK(e != 0, "%s of block %lu (= the block count) fails: %ld", pname[p], (unsigned long)N, (long)e);
+            if ((e = rd(c, p, N + 1000, 1, b)) != E_RANGE)
+                CK(e != 0, "%s 1000 blocks past the end fails: %ld", pname[p], (long)e);
         }
-        if (N > 140) {
+        if (N > 140 && low_path(c, N - 129, 130) == P_CMD) {   /* the whole request below 4 GB */
             memset(b, 0xee, 130 * bs);
             e = rd(c, P_CMD, N - 129, 130, b);
             CK(e != 0, "CMD_READ of 130 blocks (2 driver chunks) ending 1 past the end fails: %ld (io_Actual %lu)", (long)e,
                (unsigned long)c->io->io_Actual);
-        }
+        } else if (N > 140)
+            res(R_SKIP, grp, "CMD_READ ending past the end: the end of the unit is above 4 GB, which CMD_READ can't reach");
         /* far beyond: the top of the 32-bit block range, and 2^32 blocks */
         off64(c, 0xffffffffUL, &lo, &hi);
         memset(b, 0xee, 2 * bs);
@@ -1650,7 +1662,7 @@ static void t_edge(void)
         if (c2 && r2 && b2 && open_bounded(c2, g_unit, 0, NULL) == 0 && 32 * bs <= 140 * 4096) {
             LONG e1, e2;
             ctx_bs(c2, bs);
-            if (ref_read(c, P_CMD, 0, 16, ref) == 0 && ref_read(c, P_CMD, N - 32, 32, r2) == 0) {
+            if (ref_read(c, P_CMD, 0, 16, ref) == 0 && ref_read(c, low_path(c, N - 32, 32), N - 32, 32, r2) == 0) {
                 memset(b, 0, 16 * bs); memset(b2, 0, 32 * bs);
                 off64(c, N - 32, &lo, &hi);
                 bio_start(c, CMD_READ, b, 16 * bs, 0, 0);
@@ -2858,7 +2870,7 @@ static void t_errmap(void)
             e = bio(c, TD_WRITE64, b, U.bs, lo, hi);
             if (!HUNG())
                 CK(e != 0 && e != TDERR_WriteProt, "ERRMAP (H5) TD_WRITE64 1 block past the end: io_Error %ld %s", (long)e, tdname(e));
-            e = rd(c, P_CMD, U.blocks - 1, 1, b);
+            e = rd(c, low_path(c, U.blocks - 1, 1), U.blocks - 1, 1, b);
             CK(e == 0, "ERRMAP: the last block reads normally after the refused writes: %ld", (long)e);
         } else
             res(R_SKIP, grp, "ERRMAP write half (writes past the end): needs RAWWRITE (the unit is then scratch)");
@@ -3516,7 +3528,7 @@ int main(void)
         }
         gfree(b);
     }
-    con("flysuite 1.1: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
+    con("flysuite 1.1.1: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
            U.vendor, U.product, U.rev, U.devtype, (unsigned long)U.blocks, (unsigned long)U.bs,
            (unsigned long)(((unsigned long long)U.blocks * U.bs) >> 20), U.pattern ? ", pattern disk" : "",
            U.emu ? ", emulator" : "", U.toolbox ? ", Toolbox" : "");
@@ -3528,7 +3540,7 @@ int main(void)
            (unsigned long)(g_tmo / 1000), (unsigned long)ms);
     if (g_log) {
         char b[200];
-        sprintf(b, "flysuite 1.1: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
+        sprintf(b, "flysuite 1.1.1: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
                 (unsigned long)U.blocks, (unsigned long)U.bs, (unsigned long)g_seed);
         out_line(0, b);
     }

@@ -96,6 +96,10 @@ unknown opcode with ASC $24, not $20; both pass. A command the target does not h
 - On a pattern disk the reference is also checked against the pattern.
 - Across 2 GB, across 4 GB and above 4 GB, when the unit is that big (else SKIP). The reference
   is single-block SCSI READ(10)s.
+- CMD_READ and CMD_WRITE carry a 32-bit byte offset, so they only reach the first 4 GB. A test
+  never sends one that would start or end beyond that: there TD_READ64 does the reading, and a
+  past-the-end check CMD_READ can't make is a SKIP (since 1.1.1; 1.1 failed `edge` on a disk over
+  4 GB).
 
 **edge** (read-only):
 - Reads that end exactly at the end of the unit.

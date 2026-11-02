@@ -148,7 +148,8 @@ Writing needs an explicit option:
                             refused.
 
 The groups (TESTS=): conf (HD_SCSICMD conformance), big (1-2048 block
-reads through every path, across 2/4 GB), edge (end of unit, odd
+reads through every path, across 2/4 GB; CMD_READ only reaches the first
+4 GB, so above that the tests use TD64/NSD/SCSI), edge (end of unit, odd
 lengths, the trackdisk queries, open/close), dma16 (reads into RAM
 above 16 MB, which a Zorro II DMA controller can't reach: the driver
 must copy), latency (does a priority-21 task keep running while the
