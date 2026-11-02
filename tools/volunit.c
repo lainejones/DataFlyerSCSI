@@ -5,7 +5,8 @@
  * Prints "DEVICE=<driver> UNIT=<n>" for the volume DIR lives on, as the
  * two flysuite arguments; with VAR=<name> it is set as a local Shell
  * variable instead, so a script can write `flysuite $dt ...`, and
- * VOLVAR=<name> gets the volume ("Work:") for AmiDefrag.
+ * VOLVAR=<name> gets the DOS device ("DH1:", not the volume name) for
+ * AmiDefrag, which looks its partition up by that name.
  * Return code 0, or 20 if the drawer is not on a device-backed volume
  * (RAM:, a network share, a handler without a FileSysStartupMsg).
  *
@@ -21,7 +22,7 @@
 #include <string.h>
 #include <stdio.h>
 
-static const char ver[] __attribute__((used)) = "$VER: volunit 1.0 (31.10.2026) DriveTests";
+static const char ver[] __attribute__((used)) = "$VER: volunit 1.1 (2.11.2026) DriveTests";
 
 int main(void)
 {
@@ -45,10 +46,6 @@ int main(void)
     }
     task = ((struct FileLock *)BADDR(lock))->fl_Task;
     vol[0] = 0;
-    if (NameFromLock(lock, (STRPTR)vol, sizeof(vol))) {   /* "Work:tests/x" -> "Work:" */
-        char *c = strchr(vol, ':');
-        if (c) c[1] = 0;
-    }
     UnLock(lock);
 
     dl = LockDosList(LDF_DEVICES | LDF_READ);
@@ -64,6 +61,11 @@ int main(void)
         if (!TypeOfMem((APTR)dev) || !dev[0] || dev[0] > 60)
             continue;
         sprintf(out, "DEVICE=%.*s UNIT=%ld", dev[0], (const char *)dev + 1, (long)fssm->fssm_Unit);
+        {
+            const UBYTE *name = BADDR(dl->dol_Name);           /* "DH1" */
+            if (name && name[0] && name[0] < sizeof(vol) - 1)
+                sprintf(vol, "%.*s:", name[0], (const char *)name + 1);
+        }
         rc = 0;
         break;
     }
@@ -75,6 +77,8 @@ int main(void)
         SetVar((STRPTR)args[1], (STRPTR)out, -1, GVF_LOCAL_ONLY);
     else
         printf("%s\n", out);
+    if (rc == 0 && args[2] && vol[0])
+        SetVar((STRPTR)args[2], (STRPTR)vol, -1, GVF_LOCAL_ONLY);
     FreeArgs(rda);
     return rc;
 }

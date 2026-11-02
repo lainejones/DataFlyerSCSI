@@ -37,14 +37,11 @@ flysuite, AmiFSX and devsoak run on a 68000.
 In this drawer
   flysuite        the driver test (flysuite.md: every option and check)
   AmiFSX          the file system exerciser (AmiFSX.md)
-  AmiDefrag       the block-map analyser (AmiDefrag.md) - version 0.3,
+  AmiDefrag       the block-map analyser (AmiDefrag.md) - version 0.5,
                   by John Hertell (director) and Claude Code (code);
                   the defrag engines are beta, the analyse mode is what
-                  you want here. NOTE: in our tests (OS 3.2.3, FFS, a
-                  real A1200 and WinUAE) 0.3 printed its map in full and
-                  then REBOOTED the machine on exit. RunTests therefore
-                  skips it unless you add AMIDEFRAG; run it by hand on a
-                  machine with nothing unsaved. Reported upstream.
+                  you want here. It takes the DOS device name (DH1:),
+                  not the volume name; AmiDefrag LIST shows them all.
   devsoak         the destructive soak tester (devsoak.md: the whole
                   manual) - version 1.1, by Simon Dick (sidick). It is
                   NOT run by RunTests: it overwrites the partition or
@@ -64,10 +61,9 @@ From Workbench: double-click RunTests. It asks for a SCRATCH drawer on
 the drive to test (a file requester), works out the drive's device driver
 and unit from it, then asks Quick or Full:
   Quick  reads only, writes nothing: flysuite's conf/big/edge/dma16/
-         latency/audit
+         latency/audit, then the AmiDefrag analysis
   Full   also writes test files in that drawer (made, checked and deleted
          again) and runs AmiFSX there
-(the AmiDefrag analysis only with AMIDEFRAG on the Shell line - see above)
 The output shows in its window, every log is saved in the drawer
 (flysuite.log, amifsx.log, amidefrag.log), and a requester at the end
 says how it went. From a Shell the same, from inside this drawer:
@@ -115,7 +111,7 @@ The tools in order, on a scratch volume (by hand)
 -------------------------------------------------
   flysuite DEVICE=yourscsi.device UNIT=0 TESTS=all WRITEFILE=Scratch:t
   AmiFSX Scratch:fsxtest N=100000 P=5000 C=100 XREAD
-  AmiDefrag Scratch: MAP WIDTH=72
+  AmiDefrag DH1: MAP WIDTH=72      (Scratch:'s device; AmiDefrag LIST)
 
 and read the AmiDefrag map for anything "unknown". Then, if the scratch
 partition can go:
@@ -226,7 +222,7 @@ Credits
                                 exerciser by Avadis Tevanian Jr. (NeXT) and
                                 Apple, as carried on in FreeBSD, xfstests
                                 and LTP (GPL-3.0 for the port)
-  AmiDefrag 0.3                 John Hertell (director) and Claude Code
+  AmiDefrag 0.5                 John Hertell (director) and Claude Code
                                 (code), github.com/ChuckyGang/AmiDefrag
                                 (MIT, LICENSE-AmiDefrag) - thanks for a
                                 block-map analyser that reads FFS, PFS3

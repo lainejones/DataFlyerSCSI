@@ -1,11 +1,11 @@
 ; RunTests - DriveTests from an icon: pick a scratch drawer, pick Quick or
 ; Full, and the three tools run in turn with their logs in that drawer.
 ; Double-click RunTests (IconX runs this), or in a Shell:
-;   Execute RunTests [DIR] [Quick|Full] [SKIPIDS=<id,id>] [AMIDEFRAG]
+;   Execute RunTests [DIR] [Quick|Full] [SKIPIDS=<id,id>]
 ; (drawer and mode are asked for when left out; SKIPIDS names SCSI ids
 ; flysuite must not touch - a network adapter on the bus, e.g. a DaynaPORT;
-; AMIDEFRAG also runs the AmiDefrag 0.3 block-map analysis, which is off by
-; default: in our tests it rebooted the machine when it exited)
+; AMIDEFRAG, from 1.2 and older, is still accepted and does nothing now
+; that the analysis runs every time)
 .KEY DIR,MODE,SKIPIDS/K,AMIDEFRAG/S
 .BRA {
 .KET }
@@ -80,17 +80,11 @@ Else
   Set dt_rc2 0
 EndIf
 Echo ""
-If "{AMIDEFRAG}" EQ ""
-  Echo "3/3  AmiDefrag skipped (0.3 rebooted the machine on exit in our tests;"
-  Echo "     AMIDEFRAG runs it anyway, or by hand: AmiDefrag ${dt_vol} MAP WIDTH=72)"
-  Set dt_rc3 0
-Else
-  Echo "3/3  AmiDefrag - the structures on disk (analyse only)"
-  ; the volume of the scratch drawer, e.g. "Work:" from "Work:tests"
-  AmiDefrag ${dt_vol} MAP WIDTH=72 >"${dt_dir}/amidefrag.log"
-  Set dt_rc3 $RC
-  Type "${dt_dir}/amidefrag.log"
-EndIf
+Echo "3/3  AmiDefrag - the structures on disk (analyse only)"
+; the DOS device of the scratch drawer, e.g. "DH1:" for "Work:tests"
+AmiDefrag ${dt_vol} MAP WIDTH=72 >"${dt_dir}/amidefrag.log"
+Set dt_rc3 $RC
+Type "${dt_dir}/amidefrag.log"
 Echo ""
 Echo "----------------------------------------------------------------"
 Echo "flysuite rc ${dt_rc1}  (0 passed, 5 a FAIL, 10 a HANG)"
