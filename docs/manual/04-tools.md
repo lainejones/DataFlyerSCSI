@@ -23,7 +23,9 @@ from the RDB, as the system does for a boot drive, and every partition of that
 type uses it. FFS partitions use the ROM's FFS as before. A partition of
 another type whose file system is nowhere to be found is not mounted, with a
 message saying so: before 1.1 it was mounted with FFS, which then saw "not a
-DOS disk".
+DOS disk". From 1.1.1 RDBMount then returns 5 (WARN), so a script can tell;
+the other partitions are mounted as usual. It also returns 5 when a unit named
+in `UNITS` has no drive or no RDB.
 
 ## flytest
 

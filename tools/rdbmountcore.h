@@ -168,10 +168,11 @@ static void rm_fs_patch(struct DeviceNode *dn, struct FileSysEntry *fse)
             dst[b] = src[b];
 }
 
-/* returns number of partitions mounted, -1 = no RDSK on unit */
+/* returns number of partitions mounted, -1 = no RDSK on unit, -2 = no drive;
+ * *nofs (may be NULL) counts the partitions left out for want of a file system */
 static LONG rm_mount_unit(struct ExecBase *SysBase, struct DosLibrary *DOSBase,
                           struct ExpansionBase *ExpansionBase,
-                          const char *devname, ULONG unit, BOOL force)
+                          const char *devname, ULONG unit, BOOL force, LONG *nofs)
 {
     struct MsgPort *port;
     struct IOStdReq *io;
@@ -270,6 +271,7 @@ static LONG rm_mount_unit(struct ExecBase *SysBase, struct DosLibrary *DOSBase,
                     if (!fse && (dostype & 0xffffff00) != 0x444f5300) {
                         RM_PRINTF("  %s: no file system for its type $%08lx (not in the RDB, not loaded) - not mounted\n",
                                   (char *)namebuf, (unsigned long)dostype);
+                        if (nofs) (*nofs)++;
                     } else if ((node = (struct DeviceNode *)MakeDosNode(packet)) && fse) {
                         rm_fs_patch(node, fse);
                     }

@@ -24,7 +24,7 @@ extern struct ExecBase *SysBase;
 extern struct DosLibrary *DOSBase;
 struct ExpansionBase *ExpansionBase;
 
-static const char ver[] __attribute__((used)) = "$VER: RDBMount 1.1 (2.11.2026) DataFlyerSCSI";
+static const char ver[] __attribute__((used)) = "$VER: RDBMount 1.1.1 (2.11.2026) DataFlyerSCSI";
 static int quiet;
 #define RM_PRINTF if (!quiet) printf
 #include "rdbmountcore.h"
@@ -36,6 +36,7 @@ int main(void)
     const char *dev = args[0] ? (const char *)args[0] : "dataflyer.device";
     static const int all_units[] = { 0, 1, 2, 3, 4, 5, 6, 100, 101, -1 };
     int units[16], found[16], n = 0, i, rc = 0, total = 0;
+    LONG nofs = 0;
 
     if (!rda || (!args[1] && !args[2])) {
         printf("RDBMount [DEVICE=<name>] UNITS=<n>[,<n>...] | ALL [FORCE] [QUIET]\n");
@@ -61,12 +62,13 @@ int main(void)
         LONG r;
         found[i] = 0;
         if (!quiet) printf("%s unit %d:\n", dev, units[i]);
-        r = rm_mount_unit(SysBase, DOSBase, ExpansionBase, dev, units[i], args[3] != 0);
+        r = rm_mount_unit(SysBase, DOSBase, ExpansionBase, dev, units[i], args[3] != 0, &nofs);
         if (r == -2) { if (!quiet) printf("  no drive\n"); if (!args[2]) rc = 5; }
         else if (r < 0) { if (!quiet) printf("  no RDB on it\n"); if (!args[2]) rc = 5; }
         else { total += r; found[i] = 1; if (!quiet) printf("  %ld partition(s) mounted\n", (long)r); }
     }
     if (!quiet && args[2]) printf("RDBMount: %d partition(s) mounted\n", total);
+    if (nofs) rc = 5;                           /* a partition was left out: WARN for scripts */
     /* for the installer: the units that had an RDB, as a UNITS= list */
     {
         char list[80];

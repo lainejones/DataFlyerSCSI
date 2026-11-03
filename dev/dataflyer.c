@@ -1483,7 +1483,7 @@ struct Device *df_init(REG(d0, BPTR seg))
     dev->dd_Library.lib_Node.ln_Name = (char *)df_devname;
     dev->dd_Library.lib_Flags = LIBF_SUMUSED | LIBF_CHANGED;
     dev->dd_Library.lib_Version = 1;
-    dev->dd_Library.lib_Revision = 7;
+    dev->dd_Library.lib_Revision = 8;
     dev->dd_Library.lib_IdString = (APTR)df_idstring;
     dfdev = dev;
     AddDevice(dev);
