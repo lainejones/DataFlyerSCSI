@@ -63,6 +63,25 @@ command, so the rest of the system keeps running; and **autoboot** (no ROM on th
 Data still moves through the CPU, as on any 53C80 board without DMA: during a large
 transfer the CPU is busy moving bytes, whatever the driver does.
 
+## Mount parameters
+
+The board has no DMA: the CPU moves every byte, one at a time, so the driver
+takes any buffer at any address, in chip or fast RAM. The values in the RDB
+(HDToolBox's Advanced Options) or a mount file:
+
+| | | |
+|---|---|---|
+| **BufMemType** | `0` or `1` | any memory; the file system's buffers then go in fast RAM when there is some, where the CPU copies faster than in chip RAM |
+| **Mask** | `0xFFFFFFFF` | every address is fine, odd ones too |
+| **MaxTransfer** | `0x7FFFFFFF` | the driver splits a big request itself (64 KB a piece on the SCSI port); a smaller value only adds requests |
+
+`DF-Prep`'s own values (MaxTransfer `0x7FFFFFFF`, Mask `0xFFFFFFFE`) are fine
+too. Watch for the two swapped (MaxTransfer `0xFFFFFFFC`, Mask `0x1FE00`):
+with that Mask a file system reads one 512-byte block at a time. `RDBMount`
+spots a Mask below `0x00FFFFFE`, mounts with working values and says so, but
+leaves the RDB as it is; correct it in HDToolBox, which changes no data.
+`devlist` shows what each partition was mounted with.
+
 ## Status
 
 1.0. In daily use on the development A1200 (TF1232 68030, a ZuluSCSI as hard disks and

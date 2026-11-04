@@ -27,6 +27,25 @@ A partition can have any file system HDToolBox can put in the drive's RDB
 already, or when the RDB's copy is newer, just as the system does for a boot
 drive.
 
+## Mount parameters
+
+The board has no DMA: the CPU moves every byte, one at a time, so the driver
+takes any buffer at any address, in chip or fast RAM. Set these in
+HDToolBox (the partition's Advanced Options) or in a mount file:
+
+| | | |
+|---|---|---|
+| BufMemType | `0` or `1` | any memory; the file system's buffers then go in fast RAM when there is some, where the CPU copies faster than in chip RAM |
+| Mask | `0xFFFFFFFF` | every address is fine, odd ones too |
+| MaxTransfer | `0x7FFFFFFF` | the driver splits a big request itself (64 KB a piece on the SCSI port); a smaller value only adds requests |
+
+`DF-Prep`'s own values (MaxTransfer `0x7FFFFFFF`, Mask `0xFFFFFFFE`) are fine
+too. Watch for the two swapped (MaxTransfer `0xFFFFFFFC`, Mask `0x1FE00`):
+with that Mask a file system reads one 512-byte block at a time. `RDBMount`
+spots a Mask below `0x00FFFFFE`, mounts with working values and says so, but
+leaves the RDB as it is; correct it in HDToolBox, which changes no data.
+`devlist` shows what each partition was mounted with.
+
 ## Speed
 
 Measured on an A1200 with a TF1232 (68030 at 50 MHz), a ZuluSCSI as the SCSI
