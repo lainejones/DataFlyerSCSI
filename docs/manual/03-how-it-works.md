@@ -25,8 +25,10 @@ still busy. `DFMount` then mounted the SCSI partitions.
 `dataflyer.device` is a device of its own. Programs and file systems open it
 like any other disk driver, and it talks to the SCSI chip directly, with the
 switch set to SCSI only for the length of one command and set back to IDE
-after. Nothing else runs on the Amiga during that command (it is inside
-`Forbid()`), so no IDE access can land while the switch is the other way.
+after. The driver runs the IDE port too, and a lock keeps its SCSI and IDE
+commands apart, so no IDE access can land while the switch is the other way.
+Other programs keep running meanwhile; only the bytes themselves move in
+bursts of up to 512 bytes with interrupts off, as the original driver did.
 
 **The built-in IDE drive.** Flipping the switch has a side effect: the IDE
 drive's interrupt no longer reaches the system, and `scsi.device`, which waits

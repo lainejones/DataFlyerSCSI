@@ -27,7 +27,8 @@ cause trouble on a modern setup:
 
 `dataflyer.device` is a device of its own: file systems and programs open it like any other
 disk driver, no system component is patched, and the switch on the board is only ever flipped
-for the length of one SCSI command, with nothing else running meanwhile.
+for the length of one SCSI command. The driver runs the IDE port as well, and a lock keeps its
+SCSI and IDE commands apart, so no IDE access can land while the switch is on SCSI.
 
 ## What it offers over the original software
 
@@ -59,9 +60,11 @@ for the length of one SCSI command, with nothing else running meanwhile.
 Two things the board itself rules out: **interrupts** (the SCSI chip's interrupt pin reaches
 no CPU interrupt line; measured, see `docs/hardware.md`), so the driver polls, but it sleeps
 on a timer while a drive thinks or commits a write, and nothing is `Forbid()`den during a
-command, so the rest of the system keeps running; and **autoboot** (no ROM on the board).
-Data still moves through the CPU, as on any 53C80 board without DMA: during a large
-transfer the CPU is busy moving bytes, whatever the driver does.
+command, so other tasks keep running; and **autoboot** (no ROM on the board).
+Data still moves through the CPU, as on any 53C80 board without DMA, in bursts of up to
+512 bytes with interrupts off (an interrupt in the middle of the bus handshake stalls the
+drive; the original driver does the same). Between bursts the system gets its interrupts and
+its other tasks, but during a large transfer the CPU is mostly busy moving bytes.
 
 ## Mount parameters
 

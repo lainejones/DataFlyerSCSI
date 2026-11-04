@@ -4,9 +4,11 @@
  *
  * The board is an NCR 53C80 that shares the A1200's internal IDE (Gayle) port:
  * reading $DA1012 turns the port into the 53C80, reading $DA1016 back into the
- * IDE task file (docs/hardware.md). Every SCSI command runs inside Forbid()
- * with the port switched to SCSI only for that command, and the port is IDE
- * again before Permit(). The IDE side is driven by this driver too, once it
+ * IDE task file (docs/hardware.md). The port is switched to SCSI only for
+ * the length of one SCSI command and is IDE again after it; the bus lock
+ * (buslock) keeps SCSI and IDE commands apart, and the bytes move in short
+ * bursts with interrupts off (burst()). Nothing is Forbid()den meanwhile.
+ * The IDE side is driven by this driver too, once it
  * has taken it over from scsi.device (ide.c).
  *
  * Unit number = SCSI id (0-6) + 10 * LUN; 100 and 101 = the IDE port's master
@@ -73,7 +75,8 @@ extern const char df_devname[], df_idstring[];
 #define T_REQ_10M 420000000          /* 10 minutes: FORMAT UNIT, SANITIZE, ERASE */
 #define T_ACK      140000            /* 200 ms */
 
-/* the most transferred in one Forbid(): 64 KB, then the system gets a turn */
+/* the most in one SCSI command: 64 KB, then the bus lock is let go and an
+ * IDE request waiting for it gets a turn */
 #define CHUNK      65536
 
 /* ---- state -------------------------------------------------------------- */
@@ -433,7 +436,7 @@ static ULONG req_budget(UBYTE op)
     return T_REQ;
 }
 
-/* one SCSI command; the caller holds the bus (Forbid + SCSI selected).
+/* one SCSI command; the caller holds the bus (buslock + SCSI selected).
  * Returns the status byte, -1 (no target answers the selection), DF_PHASE
  * (the target's data phase went against the caller's direction or past its
  * buffer and the command was aborted; or the target stopped asking within
@@ -880,7 +883,7 @@ static void rw(struct IOStdReq *io, int out, int is64)
         UBYTE cdb[10];
         ULONG want = len - done, got;
         int st;
-        if (want > CHUNK && !(un->ide && !un->atapi)) want = CHUNK;   /* an IDE disk has no Forbid() */
+        if (want > CHUNK && !(un->ide && !un->atapi)) want = CHUNK;   /* an ATA disk on the IDE port splits its own */
         nblk = want / bs;
         if (nblk > 0xffff) nblk = 0xffff;
         want = nblk * bs;                        /* whole blocks: a chunk of 64 KB is not one on a 520-byte disk */
