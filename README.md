@@ -87,7 +87,7 @@ leaves the RDB as it is; correct it in HDToolBox, which changes no data.
 
 ## Status
 
-1.0. In daily use on the development A1200 (TF1232 68030, a ZuluSCSI as hard disks and
+1.0.8 (November 2026). In daily use since 1.0 on the development A1200 (TF1232 68030, a ZuluSCSI as hard disks and
 CD-ROM, a CompactFlash on the built-in IDE port), installed by the package's installer.
 Tested in WinUAE as well, which emulates the board. Known: one stall of file-system reads after
 a very large write was seen once during testing and could not be reproduced in repeated runs;
