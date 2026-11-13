@@ -76,7 +76,10 @@ extern const char df_devname[], df_idstring[];
 #define T_ACK      140000            /* 200 ms */
 
 /* the most in one SCSI command: 64 KB, then the bus lock is let go and an
- * IDE request waiting for it gets a turn */
+ * open waiting for it (a unit probe, in the opener's task) gets a turn.
+ * Requests themselves run one after another in the driver task, for every
+ * unit on both ports: the port is the 53C80 or the IDE task file, never
+ * both, so a command that takes minutes (FORMAT UNIT) holds the rest up. */
 #define CHUNK      65536
 
 /* ---- state -------------------------------------------------------------- */
@@ -420,13 +423,17 @@ done:
  * the commands that do their work before they answer - a FORMAT UNIT or
  * SANITIZE runs for minutes, a START (IMMED=0) on an old full-height drive
  * half a minute, a VERIFY or SYNCHRONIZE CACHE as long as the disk takes.
- * The 10 s limit failed those and left the target holding the bus. */
-static ULONG req_budget(UBYTE op)
+ * The 10 s limit failed those and left the target holding the bus.
+ * A burner's BLANK and CLOSE TRACK/SESSION (without IMMED) run for minutes
+ * too. The ATAPI side takes its budget from here as well (ide.c). */
+ULONG df_req_budget(UBYTE op)
 {
     switch (op) {
     case 0x04: case 0x48: case 0x19:                    /* FORMAT UNIT, SANITIZE, ERASE (tape) */
+    case 0xa1: case 0x5b:                               /* BLANK, CLOSE TRACK/SESSION (CD/DVD writers) */
         return T_REQ_10M;
     case 0x41: case 0x93:                               /* WRITE SAME (10/16) */
+    case 0x54: case 0xa6:                               /* SEND OPC INFORMATION, LOAD/UNLOAD MEDIUM */
     case 0x1d: case 0x1b:                               /* SEND DIAGNOSTIC, START STOP UNIT / LOAD UNLOAD */
     case 0x2f: case 0x8f:                               /* VERIFY (10/16) */
     case 0x35: case 0x91:                               /* SYNCHRONIZE CACHE (10/16) */
@@ -451,7 +458,7 @@ static int run_cmd(int id, int lun, const UBYTE *cdb, int cdblen,
     UBYTE c0 = cdb[0], c1 = cdb[1];
 
     *actual = 0;
-    t_req = req_budget(c0);
+    t_req = df_req_budget(c0);
     dma_timeout = 0;
     if (!select_target(id))
         return -1;
@@ -762,7 +769,18 @@ static int unit_probe(struct DFUnit *un)
      * An ATA disk has no such bit (the translation says 0: no WP there
      * unless a write fails with it, ide.c ata_fail). */
     un->wp = un->devtype == 5;
-    if (!un->ide || un->atapi) {
+    if (un->atapi) {
+        /* a packet device has MODE SENSE(10) only: WP is bit 7 of byte 3 of
+         * its 8-byte header (all pages, or the error recovery page) */
+        UBYTE h10[8];
+        for (i = 0; i < 2; i++) {
+            memset(cdb, 0, sizeof(cdb));
+            cdb[0] = 0x5a; cdb[2] = i ? 0x01 : 0x3f; cdb[8] = 8;
+            st = unit_cmd(un, cdb, 10, h10, 8, 0, &got);
+            if (st == 0 && got >= 4) { if (h10[3] & 0x80) un->wp = 1; break; }
+            if (st == 2) request_sense(un, sense_buf, 18, &got);
+        }
+    } else if (!un->ide) {
         UBYTE hdr[4];
         for (i = 0; i < 2; i++) {
             memset(cdb, 0, sizeof(cdb));
@@ -844,7 +862,7 @@ static void rw(struct IOStdReq *io, int out, int is64)
     ULONG hi = is64 ? io->io_Actual : 0, lo = io->io_Offset, len = io->io_Length, done = 0;
     ULONG bs, lba, nblk;
     UBYTE *data = io->io_Data;
-    int retried = 0;
+    int retried = 0, busy = 0;
 
     if (out) { stats.writes++; stats.wbytes += len; } else { stats.reads++; stats.rbytes += len; }
     count_size(len);
@@ -891,8 +909,17 @@ static void rw(struct IOStdReq *io, int out, int is64)
         cdb[2] = (UBYTE)(lba >> 24); cdb[3] = (UBYTE)(lba >> 16); cdb[4] = (UBYTE)(lba >> 8); cdb[5] = (UBYTE)lba;
         cdb[6] = 0; cdb[7] = (UBYTE)(nblk >> 8); cdb[8] = (UBYTE)nblk; cdb[9] = 0;
         st = unit_cmd(un, cdb, 10, data + done, want, out, &got);
+        if (st == 8 && busy < 10) {
+            /* BUSY: the target can't take a command just now (after a bus
+             * reset, say) - a quarter of a second, then the chunk again,
+             * ten times at most */
+            int k;
+            busy++;
+            for (k = 0; k < 1000; k++) wait_step(SPIN_POLLS);
+            continue;
+        }
         if (st != 0) {
-            io->io_Error = TDERR_NotSpecified;       /* no target, a bus error, BUSY, RESERVATION CONFLICT, ... */
+            io->io_Error = TDERR_NotSpecified;       /* no target, a bus error, still BUSY, RESERVATION CONFLICT, ... */
             if (st == 2) {
                 memset(sense_buf, 0, sizeof(sense_buf));
                 if (request_sense(un, sense_buf, 18, &got) == 0)
@@ -903,7 +930,21 @@ static void rw(struct IOStdReq *io, int out, int is64)
                      * swapped: tell the change interrupts (the attention is used
                      * up now, so the poller would not see it) and fail. */
                     if (un->removable) { fire_change(un); un->medium = 1; }
-                    else if (!retried) { retried = 1; io->io_Error = 0; continue; }   /* a success after the retry is a success */
+                    else if (!retried) {
+                        /* a "fixed" disk can be another one after its attention
+                         * (a ZuluSCSI's SD card swapped): the capacity is read
+                         * again first. The retry goes only when the block size is
+                         * the same and the rest still fits; else the request fails
+                         * (TDERR_DiskChanged / TDERR_SeekError) and the next one
+                         * works with the new size. */
+                        retried = 1;
+                        un->bsize = 0;
+                        if (unit_probe(un) > 0 && un->bsize == bs) {
+                            if (lba >= un->blocks || (len - done) / bs > un->blocks - lba)
+                                io->io_Error = TDERR_SeekError;
+                            else { io->io_Error = 0; continue; }   /* a success after the retry is a success */
+                        }
+                    }
                 }
             }
             io->io_Actual = done;
@@ -924,12 +965,22 @@ static void scsicmd(struct IOStdReq *io)
     ULONG got = 0;
     int st;
 
-    if (!sc || io->io_Length < sizeof(struct SCSICmd) || sc->scsi_CmdLength > 16) {
+    /* no command block is shorter than 6 bytes (the first two are read
+     * before anything is sent) */
+    if (!sc || io->io_Length < sizeof(struct SCSICmd) || !sc->scsi_Command ||
+        sc->scsi_CmdLength < 6 || sc->scsi_CmdLength > 16) {
         io->io_Error = IOERR_BADLENGTH;
         return;
     }
     st = unit_cmd(un, sc->scsi_Command, sc->scsi_CmdLength, (UBYTE *)sc->scsi_Data,
                  sc->scsi_Length, !(sc->scsi_Flags & SCSIF_READ), &got);
+    /* MODE SELECT (6/10) and FORMAT UNIT can change the block size: the
+     * cached one goes, so the next request reads the capacity again (a
+     * 256-byte run sized by a stale block size waits, interrupts off, for
+     * bytes that never come). An ATA disk's is always 512. */
+    if (!(un->ide && !un->atapi) &&
+        (sc->scsi_Command[0] == 0x15 || sc->scsi_Command[0] == 0x55 || sc->scsi_Command[0] == 0x04))
+        un->bsize = 0;
     sc->scsi_Actual = got;
     sc->scsi_CmdActual = sc->scsi_CmdLength;
     sc->scsi_SenseActual = 0;
@@ -1046,11 +1097,24 @@ static void perform(struct IOStdReq *io)
          * too - CF cards and Microdrives say removable, and a Microdrive
          * has a real write cache; only a unit known to have no medium is
          * skipped. A drive without the command answers ILLEGAL REQUEST:
-         * nothing to flush, the sense is cleared. */
+         * nothing to flush, the sense is cleared. A UNIT ATTENTION gets
+         * the command once more. MEDIUM ERROR or HARDWARE ERROR means the
+         * cache did not reach the disk: the caller is told (1.0.8 said
+         * "done" to every answer). */
         UBYTE cdb[10] = { 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         ULONG got;
-        if (!(un->removable && un->medium == 2) && unit_cmd(un, cdb, 10, NULL, 0, 0, &got) == 2)
-            request_sense(un, sense_buf, 18, &got);
+        if (!(un->removable && un->medium == 2)) {
+            int st = unit_cmd(un, cdb, 10, NULL, 0, 0, &got), k;
+            for (k = 0; st == 2 && k < 2; k++) {
+                UBYTE key;
+                memset(sense_buf, 0, sizeof(sense_buf));
+                request_sense(un, sense_buf, 18, &got);
+                key = sense_buf[2] & 0x0f;
+                if (key == 0x06 && !k) { st = unit_cmd(un, cdb, 10, NULL, 0, 0, &got); continue; }
+                if (key == 0x03 || key == 0x04) io->io_Error = sense_error(un);
+                break;
+            }
+        }
         io->io_Actual = 0;
         break;
     }
@@ -1209,7 +1273,7 @@ static void task_main(void)
         port->mp_SigTask = FindTask(NULL);
         port->mp_MsgList.lh_Head = (struct Node *)&port->mp_MsgList.lh_Tail;
         port->mp_MsgList.lh_TailPred = (struct Node *)&port->mp_MsgList.lh_Head;
-        /* the sleep timer for the waits (UNIT_MICROHZ, 1 ms steps) */
+        /* the sleep timer for the waits (UNIT_MICROHZ, 250 us steps) */
         {
             struct MsgPort *sp = CreateMsgPort();
             struct timerequest *st = sp ? (struct timerequest *)CreateIORequest(sp, sizeof(*st)) : NULL;
@@ -1486,7 +1550,7 @@ struct Device *df_init(REG(d0, BPTR seg))
     dev->dd_Library.lib_Node.ln_Name = (char *)df_devname;
     dev->dd_Library.lib_Flags = LIBF_SUMUSED | LIBF_CHANGED;
     dev->dd_Library.lib_Version = 1;
-    dev->dd_Library.lib_Revision = 8;
+    dev->dd_Library.lib_Revision = 9;
     dev->dd_Library.lib_IdString = (APTR)df_idstring;
     dfdev = dev;
     AddDevice(dev);

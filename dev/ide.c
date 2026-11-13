@@ -76,7 +76,7 @@ static UBYTE wait_ready(ULONG t)
         if (!((s = IDE(I_STAT)) & ST_BSY)) return s;
     while (used < t) {
         if (!((s = IDE(I_STAT)) & ST_BSY)) { stats.polls[W_IDE] += n; return s; }
-        used += df_pause(n);                        /* spins ~1 ms, then sleeps 1 ms at a time */
+        used += df_pause(n);                        /* spins ~1 ms, then sleeps 250 us at a time */
         n++;
     }
     stats.polls[W_IDE] += n;
@@ -166,7 +166,10 @@ static ULONG ata_xfer(struct DFUnit *un, ULONG lba, ULONG nblk, UBYTE *buf, int 
 }
 
 /* FLUSH CACHE (EXT), when IDENTIFY says the drive has it; a drive
- * without it has nothing to flush. 1 = done or nothing to do */
+ * without it has nothing to flush. 1 = done or nothing to do; 0 = the
+ * cache did not reach the disk (a time-out, a device fault, an error other
+ * than "command aborted" - a card that lists the command and then refuses
+ * it has nothing to flush either) */
 static int ata_flush(struct DFUnit *un)
 {
     UBYTE s;
@@ -176,7 +179,9 @@ static int ata_flush(struct DFUnit *un)
     IDE(I_CMD) = un->flush == 2 ? 0xea : 0xe7;
     pause400();
     s = wait_ready(T_BUSY);
-    return s != 0xff && !(s & ST_ERR);
+    if (s == 0xff || (s & ST_DF)) return 0;
+    if ((s & ST_ERR) && !(IDE(I_ERR) & 0x04)) return 0;
+    return 1;
 }
 
 /* ---- ATA: the SCSI commands a file system / HDToolBox send -------------- */
@@ -260,7 +265,7 @@ static int ata_scsi(struct DFUnit *un, const UBYTE *c, UBYTE *data, ULONG len, i
         break;
     }
     case 0x35:                                       /* SYNCHRONIZE CACHE */
-        ata_flush(un);
+        if (!ata_flush(un)) { set_sense(un, 0x04, 0x00, 0x00); return 2; }   /* HARDWARE ERROR: written data may be lost */
         break;
     case 0x08: case 0x0a:                            /* READ / WRITE (6) */
         lba = ((ULONG)(c[1] & 0x1f) << 16) | ((ULONG)c[2] << 8) | c[3];
@@ -296,7 +301,9 @@ static int ata_scsi(struct DFUnit *un, const UBYTE *c, UBYTE *data, ULONG len, i
 
 /* ---- ATAPI: the command block as a packet ------------------------------- */
 
-#define T_PACKET 21000000            /* 30 s in CIA reads for a whole packet command */
+#define T_PACKET 21000000            /* 30 s in CIA reads for a whole packet command - or the
+                                      * opcode's own budget when that is longer (df_req_budget:
+                                      * FORMAT UNIT, BLANK, CLOSE SESSION, ... run for minutes) */
 #define T_JUNK   (1UL << 20)         /* at most 1 MB the caller has no room for, then the drive is reset */
 
 /* BSY clear and DRQ, ERR or the status phase (interrupt reason I/O + C/D;
@@ -336,6 +343,7 @@ static int atapi_cmd(struct DFUnit *un, const UBYTE *cdb, int cdblen, UBYTE *dat
     int i, bad = 0;
 
     *actual = 0;
+    if (df_req_budget(cdb[0]) > left) left = df_req_budget(cdb[0]);
     memset(pkt, 0, sizeof(pkt));
     memcpy(pkt, cdb, cdblen > 12 ? 12 : cdblen);
     s = select_drive(un, 0);
@@ -351,7 +359,7 @@ static int atapi_cmd(struct DFUnit *un, const UBYTE *cdb, int cdblen, UBYTE *dat
     /* The direction is the device's, from the interrupt reason (I/O = 1:
      * to the host), never the caller's flag: 1.0.4 read the data port while
      * the device waited for data (or the other way round) and went round
-     * forever. Every wait is out of one 30 s budget. */
+     * forever. Every wait is out of the command's one budget (30 s or more). */
     for (;;) {
         ULONG cnt, k;
         UBYTE ir;
@@ -534,7 +542,15 @@ static void sd_open(REG(a1, struct IOStdReq *io), REG(d0, ULONG unit), REG(d1, U
                     REG(a6, struct Device *dev))
 {
     if (unit < 2) {                                   /* the IDE port: ours now */
-        struct DFUnit *un = ide_units[unit];
+        struct DFUnit *un;
+        /* this vector is live before the takeover has identified the drives
+         * (it holds the bus semaphore until then): wait for it, as ide_mapped
+         * does, instead of "no such unit" for a drive that is there */
+        if (!taken) {
+            ObtainSemaphore(&buslock);
+            ReleaseSemaphore(&buslock);
+        }
+        un = ide_units[unit];
         if (!un) { io->io_Error = TDERR_BadUnitNum; return; }
         un->u.unit_OpenCnt++;
         dfdev->dd_Library.lib_OpenCnt++;

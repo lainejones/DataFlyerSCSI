@@ -82,6 +82,7 @@ void *memset(void *d, int c, unsigned long n);
 /* dataflyer.c */
 int  df_ours(struct Unit *u);
 int  df_pause(ULONG spins);        /* one wait step: a CIA read, or a 250 us sleep after SPIN_POLLS */
+ULONG df_req_budget(UBYTE op);     /* how long a command may keep its target silent, in CIA reads */
 void df_open(REG(a1, struct IOStdReq *io), REG(d0, ULONG unitnum), REG(d1, ULONG flags),
              REG(a6, struct Device *dev));
 BPTR df_close(REG(a1, struct IOStdReq *io), REG(a6, struct Device *dev));
