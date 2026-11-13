@@ -48,7 +48,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 
-static const char version[] = "$VER: flysuite 1.1.3 (12.11.2026)";
+static const char version[] = "$VER: flysuite 1.1.4 (12.11.2026)";
 
 struct Device *TimerBase;
 
@@ -1139,8 +1139,8 @@ static void t_conf(void)
                 res(R_SKIP, grp, "READ(%d): not supported by the target (ILLEGAL REQUEST)", kinds[i]);
             else
                 CK(e == 0 && ST(c) == 0 && ACT(c) == k * bs && !memcmp(b, ref, k * bs) && guard_ok(b, k * bs),
-                   "READ(%d) %d blocks at %lu: status %d, actual %lu, data %s", kinds[i], k, (unsigned long)lba, ST(c),
-                   (unsigned long)ACT(c), memcmp(b, ref, k * bs) ? "DIFFERENT" : "same");
+                   "READ(%d) %d blocks at %lu: io_Error %ld, status %d, actual %lu, data %s", kinds[i], k, (unsigned long)lba,
+                   (long)e, ST(c), (unsigned long)ACT(c), memcmp(b, ref, k * bs) ? "DIFFERENT" : "same");
         }
     }
     /* zero-length READ(10) */
@@ -3550,7 +3550,7 @@ int main(void)
         }
         gfree(b);
     }
-    con("flysuite 1.1.3: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
+    con("flysuite 1.1.4: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
            U.vendor, U.product, U.rev, U.devtype, (unsigned long)U.blocks, (unsigned long)U.bs,
            (unsigned long)(((unsigned long long)U.blocks * U.bs) >> 20), U.pattern ? ", pattern disk" : "",
            U.emu ? ", emulator" : "", U.toolbox ? ", Toolbox" : "");
@@ -3562,7 +3562,7 @@ int main(void)
            (unsigned long)(g_tmo / 1000), (unsigned long)ms);
     if (g_log) {
         char b[200];
-        sprintf(b, "flysuite 1.1.3: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
+        sprintf(b, "flysuite 1.1.4: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
                 (unsigned long)U.blocks, (unsigned long)U.bs, (unsigned long)g_seed);
         out_line(0, b);
     }
