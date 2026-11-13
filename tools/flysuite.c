@@ -48,7 +48,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 
-static const char version[] = "$VER: flysuite 1.1.2 (2.11.2026)";
+static const char version[] = "$VER: flysuite 1.1.3 (12.11.2026)";
 
 struct Device *TimerBase;
 
@@ -1467,6 +1467,17 @@ static void j_openloop(struct Job *j)
     ctx_free(c);
 }
 
+/* did a read that had to fail come back with block 0 (the address wrapped)? A block 0 that is
+ * one byte repeated (a blank disk: all zeros) proves nothing: a driver or an emulator that
+ * clears the buffer of a refused read gives the same bytes. Then only the error counts. */
+static int wrapped(const UBYTE *p, const UBYTE *blk0, ULONG bs)
+{
+    ULONG i;
+    for (i = 1; i < bs && blk0[i] == blk0[0]; i++) ;
+    if (i == bs) return 0;
+    return !memcmp(p, blk0, bs);
+}
+
 static void t_edge(void)
 {
     struct Ctx *c = M;
@@ -1497,7 +1508,7 @@ static void t_edge(void)
             e = rd(c, p, N - 1, 2, b);
             if (HUNG()) goto out;
             if (e == E_RANGE) continue;
-            CK(e != 0 && memcmp(b + bs, blk0, bs), "%s of the last block + 1 past the end fails (%ld), no wrap", pname[p], (long)e);
+            CK(e != 0 && !wrapped(b + bs, blk0, bs), "%s of the last block + 1 past the end fails (%ld), no wrap", pname[p], (long)e);
             /* (CMD_READ refused here, unsent: those are past 4 GB, not a driver answer) */
             if ((e = rd(c, p, N, 1, b)) != E_RANGE)
                 CK(e != 0, "%s of block %lu (= the block count) fails: %ld", pname[p], (unsigned long)N, (long)e);
@@ -1515,16 +1526,16 @@ static void t_edge(void)
         off64(c, 0xffffffffUL, &lo, &hi);
         memset(b, 0xee, 2 * bs);
         e = bio(c, TD_READ64, b, 2 * bs, lo, hi);
-        CK(e != 0 && memcmp(b + bs, blk0, bs) && memcmp(b, blk0, bs), "TD_READ64 2 blocks at block $FFFFFFFF fails (%ld), no wrap to 0",
+        CK(e != 0 && !wrapped(b + bs, blk0, bs) && !wrapped(b, blk0, bs), "TD_READ64 2 blocks at block $FFFFFFFF fails (%ld), no wrap to 0",
            (long)e);
         lo = 0; hi = 1UL << U.sh;                       /* 2^32 blocks = 2^(32+sh) bytes */
 
         memset(b, 0xee, bs);
         e = bio(c, TD_READ64, b, bs, lo, hi);
-        CK(e != 0 && memcmp(b, blk0, bs), "TD_READ64 at block 2^32 (byte offset $%lx:00000000) fails (%ld), no wrap to block 0",
+        CK(e != 0 && !wrapped(b, blk0, bs), "TD_READ64 at block 2^32 (byte offset $%lx:00000000) fails (%ld), no wrap to block 0",
            (unsigned long)hi, (long)e);
         e = bio(c, NSCMD_TD_READ64, b, bs, lo, hi);
-        CK(e != 0 && memcmp(b, blk0, bs), "NSCMD_TD_READ64 at block 2^32 fails (%ld)", (long)e);
+        CK(e != 0 && !wrapped(b, blk0, bs), "NSCMD_TD_READ64 at block 2^32 fails (%ld)", (long)e);
         /* lengths and offsets that are not whole blocks: dataflyer.device rejects them with
          * IOERR_BADLENGTH (rw); another driver passes with any error, nothing transferred */
 #define BADLEN(e) ((e) == IOERR_BADLENGTH || (!g_df && (e) != 0 && (e) != E_HANG))
@@ -3539,7 +3550,7 @@ int main(void)
         }
         gfree(b);
     }
-    con("flysuite 1.1.2: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
+    con("flysuite 1.1.3: %s unit %ld: \"%s\" \"%s\" \"%s\", type %d, %lu blocks of %lu bytes (%lu MB)%s%s%s\n", g_dev, (long)g_unit,
            U.vendor, U.product, U.rev, U.devtype, (unsigned long)U.blocks, (unsigned long)U.bs,
            (unsigned long)(((unsigned long long)U.blocks * U.bs) >> 20), U.pattern ? ", pattern disk" : "",
            U.emu ? ", emulator" : "", U.toolbox ? ", Toolbox" : "");
@@ -3551,7 +3562,7 @@ int main(void)
            (unsigned long)(g_tmo / 1000), (unsigned long)ms);
     if (g_log) {
         char b[200];
-        sprintf(b, "flysuite 1.1.2: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
+        sprintf(b, "flysuite 1.1.3: %s unit %ld \"%s\" \"%s\", %lu x %lu, seed %lu\n", g_dev, (long)g_unit, U.vendor, U.product,
                 (unsigned long)U.blocks, (unsigned long)U.bs, (unsigned long)g_seed);
         out_line(0, b);
     }
